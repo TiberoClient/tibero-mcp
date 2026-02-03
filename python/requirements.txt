@@ -1,0 +1,17 @@
+# Core dependencies
+JayDeBeApi>=1.2.3
+JPype1>=1.5.0
+
+# MCP SDK - Model Context Protocol
+mcp[cli]>=1.21.1
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Logging
+loguru>=0.7.2
+
+# HTTP server for remote connections
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
