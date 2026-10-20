@@ -39,7 +39,7 @@ Python으로 구현된 Tibero MCP 서버입니다.
 
 ### Java 모듈
 
-Java Spring Boot로 구현된 Tibero MCP 서버입니다. Python 버전과 동일한 기능을 제공합니다.
+공식 MCP Java SDK 로 구현된 Tibero MCP 서버입니다. Python 버전과 동일한 기능을 제공합니다.
 
 **주요 기능:**
 - SELECT 쿼리 실행
@@ -50,6 +50,14 @@ Java Spring Boot로 구현된 Tibero MCP 서버입니다. Python 버전과 동�
 - 테이블 샘플링
 
 **문서:** [java/README.md](java/README.md)
+
+## 두 구현의 동등성
+
+Python 과 Java 는 **기능이 같아야 한다**. 도구 정의는 `spec/tools.json` 하나를 공유하고(Python 에서 생성, Java 가 읽어 등록),
+값 변환·가드 규칙과 테스트 벡터는 `spec/` 에 있다. `spec/conformance/test_parity.py` 가 두 서버를 함께 띄워 tools/list·오류·
+인증·실 DB 결과를 비교한다 — 한쪽만 바꾸면 이 테스트가 실패한다. 절차는 [spec/README.md](spec/README.md).
+
+공통 설정: `MCP_TRANSPORT`(http 기본 / stdio), `MCP_API_KEYS`(Bearer·X-API-Key·경로 키), `MCP_READ_ONLY`(쓰기 도구 제외).
 
 ## 시작하기
 

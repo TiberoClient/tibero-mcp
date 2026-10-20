@@ -1,0 +1,610 @@
+{
+  "server": {
+    "name": "tibero-mcp-server",
+    "title": "Tibero Database",
+    "version": "0.2.0",
+    "instructions": "Tools for a Tibero (Oracle-compatible) relational database.\n\nRecommended workflow:\n1. get_schema to find tables and views (optionally for one schema).\n2. get_table_info for columns, comments, primary/foreign keys and indexes before writing joins.\n3. sample_table to see real values, then execute_query for the actual question.\n4. explain_plan to validate a statement without running it.\n\nSQL dialect is Oracle-compatible: use ROWNUM or FETCH FIRST n ROWS ONLY to limit rows,\nNVL/DECODE/TO_CHAR/TO_DATE, and qualify tables as SCHEMA.TABLE. Unquoted identifiers are\nupper-case; only quote names that were created mixed-case. Do not end statements with ';'.\n"
+  },
+  "tools": [
+    {
+      "name": "execute_query",
+      "title": "Run SELECT query",
+      "description": "Run a read-only SELECT statement and return its rows.\n\nOnly SELECT/WITH statements are accepted; use execute_dml for data changes.\nIf the result is truncated, aggregate or filter in SQL rather than raising max_rows.\n",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "description": "A single SELECT or WITH ... SELECT statement, without a trailing ';'",
+            "title": "Query",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 200,
+            "description": "Maximum rows to return",
+            "maximum": 5000,
+            "minimum": 1,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "execute_queryArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "columns": {
+            "description": "Column names in select-list order",
+            "items": {
+              "type": "string"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "rows": {
+            "description": "One object per row, keyed by column name",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "row_count": {
+            "description": "Number of rows returned",
+            "title": "Row Count",
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "True when more rows existed than max_rows; narrow or aggregate the query",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "row_count",
+          "truncated"
+        ],
+        "title": "QueryResult",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Run SELECT query",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "execute_dml",
+      "title": "Run INSERT/UPDATE/DELETE",
+      "description": "Execute one DML statement in its own transaction and commit it.\n\nDDL (CREATE/DROP/ALTER/TRUNCATE...) is rejected. Run with dry_run=true first when\nthe statement could touch many rows. Writes succeed only where the connected\ndatabase account has privileges.\n",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "description": "One INSERT, UPDATE, DELETE or MERGE statement, without a trailing ';'",
+            "title": "Query",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "description": "Execute and report the affected row count, then roll back",
+            "title": "Dry Run",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "execute_dmlArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "rowcount": {
+            "description": "Rows inserted, updated or deleted",
+            "title": "Rowcount",
+            "type": "integer"
+          },
+          "committed": {
+            "description": "False when dry_run rolled the change back",
+            "title": "Committed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "rowcount",
+          "committed"
+        ],
+        "title": "DmlResult",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Run INSERT/UPDATE/DELETE",
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_schema",
+      "title": "List tables and views",
+      "description": "List tables and views visible to this account, with comments and row-count statistics.",
+      "inputSchema": {
+        "properties": {
+          "schema_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Schema (owner) to list; omit for every non-system schema",
+            "title": "Schema Name"
+          }
+        },
+        "title": "get_schemaArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "SchemaObject": {
+            "properties": {
+              "schema_name": {
+                "title": "Schema Name",
+                "type": "string"
+              },
+              "object_name": {
+                "description": "Exact dictionary name (case-sensitive)",
+                "title": "Object Name",
+                "type": "string"
+              },
+              "object_type": {
+                "description": "TABLE or VIEW",
+                "title": "Object Type",
+                "type": "string"
+              },
+              "num_rows": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Row count from the last statistics run, if any",
+                "title": "Num Rows"
+              },
+              "last_analyzed": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Last Analyzed"
+              },
+              "comments": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Comments"
+              }
+            },
+            "required": [
+              "schema_name",
+              "object_name",
+              "object_type"
+            ],
+            "title": "SchemaObject",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "objects": {
+            "items": {
+              "$ref": "#/$defs/SchemaObject"
+            },
+            "title": "Objects",
+            "type": "array"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "objects",
+          "count"
+        ],
+        "title": "SchemaResult",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "List tables and views",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_table_info",
+      "title": "Describe table or view",
+      "description": "Describe a table or view: columns with comments, constraints (including foreign-key targets) and indexes.",
+      "inputSchema": {
+        "properties": {
+          "schema_name": {
+            "description": "Schema (owner) name",
+            "title": "Schema Name",
+            "type": "string"
+          },
+          "table_name": {
+            "description": "Table or view name; an unquoted name is also tried upper-case",
+            "title": "Table Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_name",
+          "table_name"
+        ],
+        "title": "get_table_infoArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "schema_name": {
+            "title": "Schema Name",
+            "type": "string"
+          },
+          "table_name": {
+            "title": "Table Name",
+            "type": "string"
+          },
+          "object_type": {
+            "description": "TABLE or VIEW",
+            "title": "Object Type",
+            "type": "string"
+          },
+          "comments": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Comments"
+          },
+          "columns": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "constraints": {
+            "description": "PK (P), FK (R, with REFERENCES), unique (U) and check (C) constraints",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Constraints",
+            "type": "array"
+          },
+          "indexes": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Indexes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema_name",
+          "table_name",
+          "object_type",
+          "columns",
+          "constraints",
+          "indexes"
+        ],
+        "title": "TableInfo",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Describe table or view",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "explain_plan",
+      "title": "Explain SQL plan",
+      "description": "Show the optimizer's execution plan for a statement without running it.\n\nAlso a cheap way to validate SQL: invalid identifiers or syntax come back as errors.\n",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "description": "SELECT or DML statement to analyze; it is not executed",
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "explain_planArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "PlanStep": {
+            "properties": {
+              "id": {
+                "title": "Id",
+                "type": "integer"
+              },
+              "parent_id": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Parent Id"
+              },
+              "depth": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Depth"
+              },
+              "operation": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Operation"
+              },
+              "object_owner": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Object Owner"
+              },
+              "object_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Object Name"
+              },
+              "cost": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Cost"
+              },
+              "cardinality": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Cardinality"
+              },
+              "access_predicates": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Access Predicates"
+              },
+              "filter_predicates": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Filter Predicates"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "title": "PlanStep",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "steps": {
+            "items": {
+              "$ref": "#/$defs/PlanStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "total_cost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Cost of the root step",
+            "title": "Total Cost"
+          },
+          "plan_text": {
+            "description": "Indented plan tree for reading",
+            "title": "Plan Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "steps",
+          "plan_text"
+        ],
+        "title": "ExplainResult",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Explain SQL plan",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "sample_table",
+      "title": "Sample table rows",
+      "description": "Return the first rows of a table or view to see real values and formats.",
+      "inputSchema": {
+        "properties": {
+          "schema_name": {
+            "description": "Schema (owner) name",
+            "title": "Schema Name",
+            "type": "string"
+          },
+          "table_name": {
+            "description": "Table or view name; an unquoted name is also tried upper-case",
+            "title": "Table Name",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Number of rows",
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_name",
+          "table_name"
+        ],
+        "title": "sample_tableArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "columns": {
+            "description": "Column names in select-list order",
+            "items": {
+              "type": "string"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "rows": {
+            "description": "One object per row, keyed by column name",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "row_count": {
+            "description": "Number of rows returned",
+            "title": "Row Count",
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "True when more rows existed than max_rows; narrow or aggregate the query",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "row_count",
+          "truncated"
+        ],
+        "title": "QueryResult",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Sample table rows",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

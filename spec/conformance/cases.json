@@ -1,0 +1,47 @@
+{
+  "leading_keyword": [
+    ["select 1 from dual", "SELECT"],
+    ["  -- note\n/* block */ (SELECT 1 FROM dual)", "SELECT"],
+    ["WITH t AS (SELECT 1 x FROM dual) SELECT * FROM t", "WITH"],
+    ["delete from t", "DELETE"],
+    ["/* multi\nline */ merge into t using s on (1=1) when matched then update set a = 1", "MERGE"],
+    ["", ""],
+    ["123", ""]
+  ],
+  "normalize": [
+    ["  SELECT 1 FROM dual ;; ", "SELECT 1 FROM dual"],
+    ["SELECT ';' FROM dual", "SELECT ';' FROM dual"],
+    ["\n\tSELECT 1 FROM dual\n", "SELECT 1 FROM dual"]
+  ],
+  "normalize_rejects": [" ; ", "", ";;"],
+  "select_rejects": ["DELETE FROM t", "DROP TABLE t", "BEGIN NULL; END", "/* x */ UPDATE t SET a = 1", "CALL p()"],
+  "select_accepts": ["SELECT 1 FROM dual", "with t as (select 1 from dual) select * from t", "(SELECT 1 FROM dual)"],
+  "dml_rejects": ["DROP TABLE t", "TRUNCATE TABLE t", "SELECT 1 FROM dual", "GRANT SELECT ON t TO u", "CREATE TABLE t (a NUMBER)"],
+  "dml_accepts": ["INSERT INTO t VALUES (1)", "update t set a = 1", "DELETE FROM t WHERE 1 = 0", "MERGE INTO t USING s ON (1=1) WHEN MATCHED THEN UPDATE SET a = 1"],
+  "quote_identifier": [["ORDERS", "\"ORDERS\""], ["a\"b", "\"a\"\"b\""]],
+  "unique_labels": [
+    [["ID", "NAME"], ["ID", "NAME"]],
+    [["ID", "ID", "ID"], ["ID", "ID_2", "ID_3"]],
+    [["ID", "ID_2", "ID"], ["ID", "ID_2", "ID_3"]]
+  ],
+  "decimal": [
+    ["42", 42],
+    ["42.000", 42],
+    ["-7", -7],
+    ["1.5", 1.5],
+    ["0.1", 0.1],
+    ["9007199254740991", 9007199254740991],
+    ["9007199254740992", "9007199254740992"],
+    ["123456789012345678901234567890", "123456789012345678901234567890"],
+    ["1E+3", 1000]
+  ],
+  "truncate": {
+    "max_chars": 4000,
+    "cases": [
+      [{"repeat": "x", "count": 4000}, {"repeat": "x", "count": 4000}],
+      [{"repeat": "x", "count": 5000}, {"repeat": "x", "count": 4000, "suffix": "...[truncated 1000 chars]"}],
+      [{"repeat": "😀", "count": 4001}, {"repeat": "😀", "count": 4000, "suffix": "...[truncated 1 chars]"}]
+    ]
+  },
+  "env_flag": [["true", true], ["TRUE", true], ["1", true], ["yes", true], ["on", true], [" true ", true], ["false", false], ["0", false], ["", false], ["no", false]]
+}

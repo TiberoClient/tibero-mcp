@@ -1,0 +1,6 @@
+**/.venv
+**/.gradle
+**/build
+**/__pycache__
+**/mcp.cfg
+python/lib

@@ -39,7 +39,7 @@ A Tibero MCP server implemented in Python.
 
 ### Java Module
 
-A Tibero MCP server implemented in Java Spring Boot. Provides the same features as the Python version.
+A Tibero MCP server implemented on the official MCP Java SDK. Provides the same features as the Python version.
 
 **Key Features:**
 - SELECT query execution
@@ -50,6 +50,16 @@ A Tibero MCP server implemented in Java Spring Boot. Provides the same features 
 - Table sampling
 
 **Documentation:** [java/README.md](java/README.md)
+
+## Keeping the implementations identical
+
+Python and Java must stay **functionally identical**. Tool definitions live in one file, `spec/tools.json`
+(generated from Python, loaded by Java); value and guard rules and shared test vectors are in `spec/`.
+`spec/conformance/test_parity.py` starts both servers and compares tools/list, errors, authentication and
+real database results, so a change made on one side only fails it. See [spec/README.md](spec/README.md).
+
+Common settings: `MCP_TRANSPORT` (http default / stdio), `MCP_API_KEYS` (Bearer, X-API-Key or path key),
+`MCP_READ_ONLY` (leave out tools that change data).
 
 ## Getting Started
 
