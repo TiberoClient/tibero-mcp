@@ -1,340 +1,52 @@
 # Tibero MCP Server (Java)
 
-An MCP (Model Context Protocol) server for Tibero DBMS. Implemented in Java.
+Java implementation of the Tibero MCP server, built on the official MCP Java SDK
+(`io.modelcontextprotocol.sdk:mcp` 2.1.0) with Jetty 12 and HikariCP. It is **functionally identical
+to the Python implementation** (`../python`): tool names, descriptions, annotations and input/output
+schemas come from the shared `spec/tools.json`, and settings, authentication, error texts and value
+conversion are the same. See [../spec/README.md](../spec/README.md).
 
-## Overview
+## Tools
 
-This project is a Java-based Tibero MCP server. It supports both STDIO and HTTP modes.
+| Tool | Kind | Description |
+|---|---|---|
+| `execute_query` | read | SELECT / WITH only; `max_rows` (default 200, max 5000), `truncated` when more rows existed |
+| `execute_dml` | write (destructive) | One INSERT/UPDATE/DELETE/MERGE in its own transaction; DDL rejected; `dry_run` rolls back |
+| `get_schema` | read | Tables and views with comments and row statistics (system schemas excluded by default) |
+| `get_table_info` | read | Columns, PK/FK (with referenced table/columns), UNIQUE/CHECK, index columns |
+| `explain_plan` | read | Plan from `PLAN_TABLE`, created and read in one transaction, then rolled back |
+| `sample_table` | read | First n rows (default 10, max 1000) |
 
-## Key Features
+`MCP_READ_ONLY=true` leaves `execute_dml` unregistered.
 
-- **execute_query** - SELECT query execution
-- **execute_dml** - DML statement execution (INSERT, UPDATE, DELETE)
-- **get_schema** - Schema information retrieval
-- **get_table_info** - Table/view detailed information
-- **explain_plan** - Execution plan retrieval
-- **sample_table** - Table sampling
-
-## Requirements
-
-- Java JDK 17 or higher
-- Gradle 7.0 or higher (build tool)
-- Tibero DBMS
-- Tibero JDBC driver (automatically downloaded from Maven Central)
-
-## Quick Start
-
-### 1. Build
+## Build and run
 
 ```bash
-./gradlew clean build
+cd java
+./gradlew shadowJar   # build/libs/tibero-mcp-server-<version>.jar (self-contained)
+./gradlew test
+MCP_TRANSPORT=stdio TIBERO_HOST=… TIBERO_DATABASE=… TIBERO_USER=… TIBERO_PASSWORD=… \
+  java -jar build/libs/tibero-mcp-server-0.2.0.jar
 ```
 
-Built JAR file: `build/libs/tibero-mcp-server-{version}.jar`
+Docker, from the repository root: `docker build -f java/Dockerfile -t tibero-mcp-java .`
 
-### 2. Configure Database Connection Information
+Requires JDK 17+ to build and Java 17+ to run; the JDBC driver `com.tmaxtibero:tbjdbc17:7.2.6` is bundled.
 
-Set via environment variables (recommended):
+## Configuration
 
-| Environment Variable | Description | Default | Required |
-|---------------------|-------------|---------|----------|
-| `TIBERO_HOST` | Database host | `localhost` | ❌ |
-| `TIBERO_PORT` | Database port | `8629` | ❌ |
-| `TIBERO_DATABASE` | Database name | `tibero` | ❌ |
-| `TIBERO_USER` | Username | `tibero` | ❌ |
-| `TIBERO_PASSWORD` | Password | - | ✅ |
+Environment variables, or `mcp.cfg` (KEY=VALUE) in the working directory (`MCP_CONFIG_FILE` to override);
+the environment wins. The variables are the same as the Python server's — see `../python/mcp.cfg.example`.
+Since 0.2.0 the default transport is `http`; set `MCP_TRANSPORT=stdio` for stdio clients.
+Logs go to stderr only.
 
-**Configuration Example:**
+## Authentication (HTTP)
 
-```bash
-# Linux/Mac
-export TIBERO_HOST=localhost
-export TIBERO_PORT=8629
-export TIBERO_DATABASE=tibero
-export TIBERO_USER=tibero
-export TIBERO_PASSWORD=your_password
-
-# Windows (PowerShell)
-$env:TIBERO_HOST="localhost"
-$env:TIBERO_PORT="8629"
-$env:TIBERO_DATABASE="tibero"
-$env:TIBERO_USER="tibero"
-$env:TIBERO_PASSWORD="your_password"
-```
-
-Or set directly in `src/main/resources/application.yml`:
-
-```yaml
-spring:
-  datasource:
-    host: localhost
-    port: 8629
-    database: tibero
-    username: tibero
-    password: your_password
-```
-
-Or **set directly in the Cursor configuration file (`~/.cursor/mcp.json`) using the `env` field** (most convenient method):
-
-```json
-{
-  "mcpServers": {
-    "tibero-java": {
-      "command": "java",
-      "args": ["-jar", "/path/to/tibero-mcp-server-{version}.jar"],
-      "env": {
-        "TIBERO_HOST": "localhost",
-        "TIBERO_PORT": "8629",
-        "TIBERO_DATABASE": "tibero",
-        "TIBERO_USER": "tibero",
-        "TIBERO_PASSWORD": "your_password"
-      }
-    }
-  }
-}
-```
-
-> **Note**: 
-> - If environment variables are set, environment variable values take precedence
-> - Values in the Cursor configuration file's `env` field take precedence over system environment variables
-> - Setting directly in the Cursor configuration file is more convenient as you don't need to set system environment variables
-
-### 3. Select Execution Mode
-
-This MCP server supports two execution modes:
-
-| Mode | Description | Executor | Use Case |
-|------|-------------|----------|----------|
-| **STDIO** | Communication via stdin/stdout | Cursor automatically executes | Local development, single user |
-| **HTTP** | Run as HTTP server | User executes directly | Remote access, multiple users |
-
-> **Important**: 
-> - **STDIO Mode**: Cursor automatically executes the process, so **you don't need to run it manually**. Just configure Cursor.
-> - **HTTP Mode**: **You must run the server in advance** for Cursor to connect.
-
-#### STDIO Mode (Default, Recommended)
-
-Cursor automatically executes the process, so no separate execution is needed. Just configure Cursor connection.
-
-> **Note**: To run directly for testing purposes:
-> ```bash
-> java -jar build/libs/tibero-mcp-server-{version}.jar
-> # Or during development
-> ./gradlew run
-> ```
-
-#### HTTP Mode
-
-**You must run the server directly.**
-
-1. Configure `src/main/resources/application.yml`:
-
-```yaml
-spring:
-  main:
-    web-application-type: servlet
-  ai:
-    mcp:
-      server:
-        stdio: false
-        http:
-          enabled: true
-          protocol: STREAMABLE
-
-server:
-  port: 8080  # Default
-```
-
-2. Run the server:
-
-```bash
-# Run JAR
-java -Dmcp.mode.http=true -jar build/libs/tibero-mcp-server-{version}.jar
-
-# Or during development
-./gradlew run -Dmcp.mode.http=true
-```
-
-Once the server starts, it will be accessible at `http://localhost:8080`. **You must keep this server running** for Cursor to connect.
-
-## Cursor Connection Configuration
-
-Add the following configuration to the `~/.cursor/mcp.json` file:
-
-### STDIO Mode (Recommended)
-
-**Cursor automatically executes the process.** You don't need to run the process separately.
-
-**Linux/Mac:**
-
-```json
-{
-  "mcpServers": {
-    "tibero-java": {
-      "command": "java",
-      "args": ["-jar", "/path/to/tibero-mcp/java/build/libs/tibero-mcp-server-{version}.jar"]
-    }
-  }
-}
-```
-
-**Windows:**
-
-```json
-{
-  "mcpServers": {
-    "tibero-java": {
-      "command": "java",
-      "args": ["-jar", "C:\\path\\to\\tibero-mcp\\java\\build\\libs\\tibero-mcp-server-{version}.jar"]
-    }
-  }
-}
-```
-
-**Setting Environment Variables Directly in JSON (Recommended):**
-
-You can include environment variables directly in the Cursor configuration file without setting them in the system:
-
-**Linux/Mac:**
-
-```json
-{
-  "mcpServers": {
-    "tibero-java": {
-      "command": "java",
-      "args": ["-jar", "/path/to/tibero-mcp/java/build/libs/tibero-mcp-server-{version}.jar"],
-      "env": {
-        "TIBERO_HOST": "localhost",
-        "TIBERO_PORT": "8629",
-        "TIBERO_DATABASE": "tibero",
-        "TIBERO_USER": "tibero",
-        "TIBERO_PASSWORD": "your_password"
-      }
-    }
-  }
-}
-```
-
-**Windows:**
-
-```json
-{
-  "mcpServers": {
-    "tibero-java": {
-      "command": "java",
-      "args": ["-jar", "C:\\path\\to\\tibero-mcp\\java\\build\\libs\\tibero-mcp-server-{version}.jar"],
-      "env": {
-        "TIBERO_HOST": "localhost",
-        "TIBERO_PORT": "8629",
-        "TIBERO_DATABASE": "tibero",
-        "TIBERO_USER": "tibero",
-        "TIBERO_PASSWORD": "your_password"
-      }
-    }
-  }
-}
-```
-
-> **Note**: 
-> - Replace `{version}` with the actual version number (e.g., `0.0.1`)
-> - Using the `env` field eliminates the need to set system environment variables
-> - Environment variables in the `env` field take precedence over system environment variables
-> - After configuration, restart Cursor and it will connect automatically
-
-### HTTP Mode
-
-**⚠️ Warning: To connect in HTTP mode, you must run the server first.** (Refer to the "HTTP Mode" execution method above)
-
-**Local Server:**
-
-```json
-{
-  "mcpServers": {
-    "tibero-java-http": {
-      "url": "http://localhost:8080"
-    }
-  }
-}
-```
-
-**Remote Server:**
-
-```json
-{
-  "mcpServers": {
-    "tibero-java-http": {
-      "url": "http://your-server-ip:8080"
-    }
-  }
-}
-```
-
-> **Note**: 
-> - The server must be running to connect
-> - Verify that the server address and port are correct
-> - Check firewall settings
-
-## Project Structure
-
-```
-java/
-├── src/
-│   └── main/
-│       ├── java/
-│       │   └── tibero/mcp/
-│       │       ├── TiberoMcpServerApplication.java
-│       │       ├── db/
-│       │       │   ├── DataSourceConfig.java
-│       │       │   └── DatabaseService.java
-│       │       └── tools/
-│       │           ├── ExecuteQueryTool.java
-│       │           ├── ExecuteDmlTool.java
-│       │           ├── GetSchemaTool.java
-│       │           ├── GetTableInfoTool.java
-│       │           ├── ExplainPlanTool.java
-│       │           └── SampleTableTool.java
-│       └── resources/
-│           └── application.yml
-├── build.gradle
-├── settings.gradle
-└── README.md
-```
-
-## Technology Stack
-
-- **Java 17+**: Minimum required Java version
-- **Spring Boot 3.5.3**: Application framework
-- **Spring AI MCP Server**: MCP protocol implementation
-- **Tibero JDBC Driver 7.2.4**: Tibero database connection
-- **HikariCP**: Connection pool
-- **Gradle**: Build tool
-
-## Troubleshooting
-
-### Connection Errors
-
-- Verify that Tibero database is running
-- Verify that connection information in environment variables is correct
-- Check firewall settings
-
-### JDBC Driver Errors
-
-- Gradle automatically downloads the JDBC driver from Maven Central
-- Check network connection
-
-### Permission Errors
-
-- Verify that the database user has necessary permissions
-- Access permissions to system views such as `ALL_TABLES`, `ALL_VIEWS`, `ALL_TAB_COLUMNS` are required
-
-### HTTP Mode Connection Failure
-
-- Verify that the server is running in HTTP mode
-- Verify that the server address and port are correct
-- Check firewall settings
+Send one of `MCP_API_KEYS` as `Authorization: Bearer <key>`, `X-API-Key: <key>`, or path `/<key>/mcp`.
+Without keys the server refuses to listen on a non-loopback address unless `MCP_ALLOW_ANONYMOUS=true`.
+`/healthz` is the only unauthenticated path.
 
 ## References
 
-- Python version: `../python/` directory
-- [MCP Java SDK Documentation](https://github.com/modelcontextprotocol/java-sdk)
 - [Tibero JDBC Developer Guide](https://docs.tmaxtibero.com/tibero/topics/development/jdbc-developers-guide/introduction-to-tibero-jdbc)
+- [MCP Java SDK](https://github.com/modelcontextprotocol/java-sdk)

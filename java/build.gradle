@@ -1,15 +1,17 @@
 plugins {
     id 'java'
-    id 'org.springframework.boot' version '3.5.3'
-    id 'io.spring.dependency-management' version '1.1.7'
+    id 'application'
+    id 'com.gradleup.shadow' version '9.6.1'
 }
 
 group = 'tibero.mcp'
-version = '0.0.1'
+// Kept equal to the Python package version; spec/tools.json carries it to clients.
+version = '0.2.0'
 
-java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+// Any JDK 17+ builds it; bytecode targets 17 so the jar runs on Java 17 and later.
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
 }
 
 repositories {
@@ -17,17 +19,45 @@ repositories {
 }
 
 dependencies {
-    implementation platform("org.springframework.ai:spring-ai-bom:1.1.0")
-    implementation "org.springframework.boot:spring-boot-starter-web"
-    implementation "org.springframework.boot:spring-boot-starter-actuator"
-    implementation "org.springframework.boot:spring-boot-starter-jdbc"
-    implementation "org.springframework.ai:spring-ai-starter-mcp-server"
-    implementation "org.springframework.ai:spring-ai-starter-mcp-server-webmvc"
-    implementation "org.springframework.ai:spring-ai-mcp-annotations"
-    implementation "com.tmaxtibero:tbjdbc17:7.2.4"
-    testImplementation "org.springframework.boot:spring-boot-starter-test"
+    implementation platform('io.modelcontextprotocol.sdk:mcp-bom:2.1.0')
+    implementation 'io.modelcontextprotocol.sdk:mcp'
+    implementation 'org.eclipse.jetty.ee10:jetty-ee10-servlet:12.1.14'
+    implementation 'com.zaxxer:HikariCP:7.1.0'
+    implementation 'ch.qos.logback:logback-classic:1.6.5'
+    runtimeOnly 'com.tmaxtibero:tbjdbc17:7.2.6'
+
+    testImplementation platform('org.junit:junit-bom:6.1.3')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// The shared MCP surface (tools, schemas, annotations) lives in ../spec and is
+// generated from the Python server; both implementations are tested against it.
+// (An include filter on a resources srcDir would also filter src/main/resources.)
+processResources {
+    from(rootProject.file('../spec')) {
+        include 'tools.json'
+    }
+}
+processTestResources {
+    from(rootProject.file('../spec')) {
+        include 'conformance/*.json'
+    }
+}
+
+application {
+    mainClass = 'tibero.mcp.TiberoMcpServer'
 }
 
 jar {
     enabled = false
+}
+
+shadowJar {
+    archiveClassifier = ''
+    mergeServiceFiles()
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
 }
