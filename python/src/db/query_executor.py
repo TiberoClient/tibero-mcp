@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import datetime as dt
 import os
 import re
 from decimal import Decimal
@@ -73,32 +72,108 @@ def quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+# java.sql.Types codes. The value rules below are the shared contract with the Java
+# implementation (see spec/README.md), so both servers return identical JSON.
+_NUMERIC_TYPES = {2, 3, -6, 5, 4, -5}
+_FLOAT_TYPES = {6, 7, 8}
+_BOOLEAN_TYPES = {-7, 16}
+_TIMESTAMP_TYPES = {91, 93, 2014}
+_TIME_TYPES = {92, 2013}
+_BINARY_TYPES = {-2, -3, -4, 2004}
+_MAX_SAFE_INTEGER = 2**53 - 1
+
+
 def to_json_value(value: Any) -> Any:
-    """Convert a JDBC value into something JSON can carry without loss of meaning."""
+    """Convert a Python-side value into the shared JSON form (used for already-converted values)."""
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, Decimal):
-        if value == value.to_integral_value() and abs(value) < 2**53:
-            return int(value)
-        return float(value) if abs(value) < 2**53 else str(value)
-    if isinstance(value, (dt.datetime, dt.date, dt.time)):
-        return value.isoformat()
+        return decimal_to_json(value)
     if isinstance(value, (bytes, bytearray)):
-        encoded = base64.b64encode(bytes(value)).decode("ascii")
-        return _truncate(f"base64:{encoded}")
-    return _truncate(str(value))
+        return truncate("base64:" + base64.b64encode(bytes(value)).decode("ascii"))
+    return truncate(str(value))
 
 
-def _truncate(text: str) -> str:
+def decimal_to_json(value: Decimal) -> Any:
+    """Integral values become JSON integers while exactly representable, larger ones strings; fractions doubles."""
+    # normalize() would round to the context precision (28 digits); these are exact.
+    if value == value.to_integral_value():
+        integral = int(value)
+        return integral if abs(integral) <= _MAX_SAFE_INTEGER else str(integral)
+    return float(value)
+
+
+def truncate(text: str) -> str:
+    """Cap a text cell at MAX_CELL_CHARS code points."""
     if len(text) <= MAX_CELL_CHARS:
         return text
     return text[:MAX_CELL_CHARS] + f"...[truncated {len(text) - MAX_CELL_CHARS} chars]"
 
 
+def _format_timestamp(timestamp: Any) -> str:
+    local = timestamp.toLocalDateTime()
+    text = (
+        f"{local.getYear():04d}-{local.getMonthValue():02d}-{local.getDayOfMonth():02d} "
+        f"{local.getHour():02d}:{local.getMinute():02d}:{local.getSecond():02d}"
+    )
+    micros = int(local.getNano()) // 1000
+    return f"{text}.{micros:06d}" if micros else text
+
+
+def _read_value(rs: Any, col: int, sql_type: int) -> Any:
+    """Read one JDBC column into the shared JSON form."""
+    if sql_type in _BOOLEAN_TYPES:
+        value = rs.getBoolean(col)
+        return None if rs.wasNull() else bool(value)
+    if sql_type in _NUMERIC_TYPES:
+        value = rs.getBigDecimal(col)
+        return None if value is None else decimal_to_json(Decimal(str(value.toPlainString())))
+    if sql_type in _FLOAT_TYPES:
+        value = rs.getDouble(col)
+        return None if rs.wasNull() else float(value)
+    if sql_type in _TIMESTAMP_TYPES:
+        value = rs.getTimestamp(col)
+        return None if value is None else _format_timestamp(value)
+    if sql_type in _TIME_TYPES:
+        value = rs.getTime(col)
+        return None if value is None else str(value.toString())
+    if sql_type in _BINARY_TYPES:
+        value = rs.getBytes(col)
+        return None if value is None else truncate("base64:" + base64.b64encode(bytes(value)).decode("ascii"))
+    value = rs.getString(col)
+    return None if value is None else truncate(str(value))
+
+
+def unique_labels(labels: list[str]) -> list[str]:
+    """Make column labels unique (ID, ID_2, ...) so rows keyed by label lose no column."""
+    used: set[str] = set()
+    result = []
+    for label in labels:
+        name, suffix = label, 1
+        while name in used:
+            suffix += 1
+            name = f"{label}_{suffix}"
+        used.add(name)
+        result.append(name)
+    return result
+
+
 def _fetch_dicts(cursor: jaydebeapi.Cursor, limit: int | None = None) -> tuple[list[str], list[dict[str, Any]]]:
-    columns = [desc[0] for desc in cursor.description] if cursor.description else []
-    rows = cursor.fetchall() if limit is None else cursor.fetchmany(limit)
-    return columns, [{col: to_json_value(row[i]) for i, col in enumerate(columns)} for row in rows]
+    """Read rows straight from the JDBC ResultSet with the shared value rules.
+
+    JayDeBeApi's own converters drop the time of DATE values, print LOBs as Java
+    object names and overflow large integers, so they are bypassed.
+    """
+    meta, rs = cursor._meta, cursor._rs
+    if meta is None or rs is None:
+        return [], []
+    count = int(meta.getColumnCount())
+    columns = unique_labels([str(meta.getColumnLabel(i)) for i in range(1, count + 1)])
+    types = [int(meta.getColumnType(i)) for i in range(1, count + 1)]
+    rows: list[dict[str, Any]] = []
+    while (limit is None or len(rows) < limit) and rs.next():
+        rows.append({columns[i]: _read_value(rs, i + 1, types[i]) for i in range(count)})
+    return columns, rows
 
 
 def execute_select_query_and_fetch_results(

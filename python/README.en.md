@@ -1,221 +1,48 @@
 # Tibero MCP Server (Python)
 
-An MCP (Model Context Protocol) server for Tibero DBMS. Implemented in Python.
+Python implementation of the Tibero MCP server on the MCP Python SDK 2.x (`MCPServer`). It is
+**functionally identical to the Java implementation** (`../java`); the tool surface is exported to
+`../spec/tools.json` (`python -m src.spec > ../spec/tools.json`) and both servers are tested against it.
+See [../spec/README.md](../spec/README.md). The Korean [README.md](README.md) has the full guide.
 
-## Key Features
+## Tools
 
-This MCP server provides the following tools:
+| Tool | Kind | Description |
+|---|---|---|
+| `execute_query` | read | SELECT / WITH only; `max_rows` (default 200, max 5000), `truncated` when more rows existed |
+| `execute_dml` | write (destructive) | One INSERT/UPDATE/DELETE/MERGE in its own transaction; DDL rejected; `dry_run` rolls back |
+| `get_schema` | read | Tables and views with comments and row statistics (system schemas excluded by default) |
+| `get_table_info` | read | Columns, PK/FK (with referenced table/columns), UNIQUE/CHECK, index columns |
+| `explain_plan` | read | Plan from `PLAN_TABLE`, created and read in one transaction, then rolled back |
+| `sample_table` | read | First n rows (default 10, max 1000) |
 
-### 1. **execute_query** - SELECT Query Execution
-- Execute SELECT queries and return results as JSON arrays
-- Support for parameterized queries
-- Return all rows as dictionaries
+Every tool declares MCP annotations and an output schema and returns `structuredContent`; database
+errors come back as `isError` results carrying the Tibero message. `MCP_READ_ONLY=true` leaves
+`execute_dml` unregistered.
 
-### 2. **execute_dml** - DML Statement Execution
-- Execute INSERT, UPDATE, DELETE statements
-- Automatic transaction management (commit on success, rollback on failure)
-- Return number of affected rows
-
-### 3. **get_schema** - Schema Information Retrieval
-- Retrieve list of all tables and views in the database
-- Include comments for each table/view
-- Filter by specific schema
-- Include metadata such as tablespace, row count, last analyzed date
-
-### 4. **get_table_info** - Table/View Detailed Information
-- Retrieve detailed information for a specific table or view
-- **Column Information**: name, data type, length, precision, NULL allowed, default value, **column comment**
-- **Constraints**: constraint name, type, status, etc.
-- **Indexes**: index name, type, uniqueness, status, etc.
-- Support for both tables and views (constraints/indexes are usually empty arrays for views)
-
-### 5. **explain_plan** - Execution Plan Retrieval
-- Analyze SQL query execution plan without actually executing
-- Validate whether SQL is executable
-- Return detailed execution plan information (using DBMS_XPLAN.DISPLAY or PLAN_TABLE)
-- Return error message if SQL is invalid
-
-### 6. **sample_table** - Table Sampling
-- Sample n rows from a specific table
-- Query only necessary rows without loading all data
-- Default: 10 rows, Maximum: 1000 rows
-- Useful for quickly checking table structure and data
-
-## Requirements
-
-- Python 3.12 or higher
-- Java JDK 8 or higher (for JDBC driver execution)
-- Tibero DBMS
-- Tibero JDBC driver (tbjdbc8*.jar)
-
-## Installation
-
-### 1. Clone Repository
-
-```bash
-git clone <repository-url>
-cd tibero-mcp/python
-```
-
-### 2. Install Dependencies
+## Setup
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 3. Prepare JDBC Driver
-
-Place the Tibero JDBC driver in the `lib/` directory:
-
-- File: `lib/tbjdbc8-7.2.4.jar` (or file matching `tbjdbc8*.jar` pattern)
-- JDBC driver can be found in the Tibero installation directory
-
-### 4. Configure Environment Variables
-
-Copy `mcp.cfg.example` to create `mcp.cfg` and enter database connection information:
-
-```bash
-# Windows
-copy mcp.cfg.example mcp.cfg
-
-# Linux/Mac
-cp mcp.cfg.example mcp.cfg
-```
-
-Edit the `mcp.cfg` file to set Tibero database connection information:
-
-```ini
-# Tibero Database Connection
-TIBERO_HOST=your_host
-TIBERO_PORT=8629
-TIBERO_DATABASE=your_database
-TIBERO_USER=your_username
-TIBERO_PASSWORD=your_password
-
-# MCP Server Configuration
-MCP_TRANSPORT=http          # http (default) or stdio
-MCP_SERVER_HOST=0.0.0.0     # 0.0.0.0: all interfaces, localhost: local only
-MCP_SERVER_PORT=8000        # HTTP server port
-LOG_LEVEL=INFO
-```
-
-## Execution
-
-```bash
+curl -o lib/tbjdbc17-7.2.6.jar https://repo1.maven.org/maven2/com/tmaxtibero/tbjdbc17/7.2.6/tbjdbc17-7.2.6.jar
+cp mcp.cfg.example mcp.cfg   # fill in the connection; environment variables win
 python -m src.main
 ```
 
-The server runs in two ways depending on the `MCP_TRANSPORT` setting in `mcp.cfg` (default: http):
+Requires Python 3.12+ and Java 17+ (for the JDBC driver). Docker: `docker build -t tibero-mcp .`
+(the driver is downloaded and checksum-verified during the build).
 
-### 1. HTTP Server Mode (Default)
+## Transport and authentication
 
-If the setting is omitted or `MCP_TRANSPORT=http`, it runs as an HTTP server.
+`MCP_TRANSPORT=http` (default; stateless Streamable HTTP with JSON responses at `MCP_HTTP_PATH`, `/mcp`)
+or `stdio`. Over HTTP, send one of `MCP_API_KEYS` as `Authorization: Bearer <key>`, `X-API-Key: <key>`,
+or path `/<key>/mcp`. Without keys the server refuses to listen on a non-loopback address unless
+`MCP_ALLOW_ANONYMOUS=true`. `/healthz` is unauthenticated. Access logs redact path keys.
 
-**Features:**
-- Accessible from remote clients
-- Multiple clients can connect simultaneously
-- Communication over network
+## Tests
 
-**Startup Message:**
+```bash
+pip install -r requirements-dev.txt
+pytest tests                      # unit tests (shared vectors) + spec drift check
+pytest ../spec/conformance        # Python ⇄ Java parity (build the Java jar first)
 ```
-Starting Tibero MCP Server as Streamable HTTP server on 0.0.0.0:8000
-Server will be accessible at: http://0.0.0.0:8000
-MCP endpoint: http://0.0.0.0:8000/mcp
-```
-
-### 2. stdio Server Mode
-
-If `MCP_TRANSPORT=stdio` is set, it runs as a stdio server.
-
-**Startup Message:**
-```
-Starting Tibero MCP Server as stdio server
-Server will communicate via stdin/stdout
-```
-
-**Server Shutdown:**
-- Press `Ctrl + C` in the terminal to stop the server.
-
-## Cursor Connection Configuration
-
-### HTTP Server Mode Connection
-
-To connect to a remote HTTP server, configure the `~/.cursor/mcp.json` file as follows:
-
-```json
-{
-  "mcpServers": {
-    "tibero": {
-      "url": "http://your-server-ip:8000/mcp"
-    }
-  }
-}
-```
-
-**Local Server Connection:**
-```json
-{
-  "mcpServers": {
-    "tibero": {
-      "url": "http://localhost:8000/mcp"
-    }
-  }
-}
-```
-
-### stdio Server Mode Connection
-
-To connect to a local stdio server, configure the `~/.cursor/mcp.json` file as follows:
-
-```json
-{
-  "mcpServers": {
-    "tibero": {
-      "command": "python",
-      "args": ["-m", "src.main"],
-      "cwd": "/path/to/tibero-mcp/python"
-    }
-  }
-}
-```
-
-After configuration, restart Cursor to use the MCP tools.
-
-## Project Structure
-
-```
-python/
-├── src/
-│   ├── db/                      # Database module
-│   │   ├── __init__.py
-│   │   ├── connector.py         # JDBC connection management
-│   │   ├── query_executor.py    # Query execution and execution plan
-│   │   └── schema_viewer.py     # Schema information retrieval
-│   ├── mcp/                     # MCP server
-│   │   ├── __init__.py
-│   │   └── server.py            # FastMCP server and tool definitions
-│   └── main.py                  # Entry point
-├── lib/                         # JDBC driver
-│   └── tbjdbc8-7.2.4.jar
-├── mcp.cfg.example              # Configuration file example
-├── requirements.txt             # Python dependencies
-└── README.md                    # This file
-```
-
-## Troubleshooting
-
-### Connection Errors
-
-- Verify that Tibero database is running
-- Verify that connection information in `mcp.cfg` is correct
-- Check firewall settings (for HTTP server mode)
-
-### JDBC Driver Errors
-
-- Verify that `tbjdbc8*.jar` file exists in the `lib/` directory
-- Verify that Java JDK is installed and `JAVA_HOME` is set
-
-### Permission Errors
-
-- Verify that the database user has necessary permissions
-- Access permissions to system views such as `ALL_TABLES`, `ALL_VIEWS`, `ALL_TAB_COLUMNS` are required

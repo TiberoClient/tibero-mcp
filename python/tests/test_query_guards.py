@@ -1,66 +1,92 @@
-import datetime as dt
+"""SQL guard and value rules, driven by the vectors shared with the Java tests."""
+
+import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from src.db.query_executor import (
+    MAX_CELL_CHARS,
+    decimal_to_json,
     ensure_dml,
     ensure_select,
     leading_keyword,
     normalize_statement,
     quote_identifier,
-    to_json_value,
+    truncate,
+    unique_labels,
 )
+from src.main import env_flag
+
+CASES = json.loads((Path(__file__).parents[2] / "spec" / "conformance" / "cases.json").read_text(encoding="utf-8"))
 
 
-@pytest.mark.parametrize(
-    "sql, keyword",
-    [
-        ("select 1 from dual", "SELECT"),
-        ("  -- note\n/* block */ (SELECT 1 FROM dual)", "SELECT"),
-        ("WITH t AS (SELECT 1 x FROM dual) SELECT * FROM t", "WITH"),
-        ("delete from t", "DELETE"),
-        ("", ""),
-    ],
-)
+@pytest.mark.parametrize("sql, keyword", CASES["leading_keyword"])
 def test_leading_keyword(sql, keyword):
     assert leading_keyword(sql) == keyword
 
 
-def test_normalize_strips_trailing_semicolons():
-    assert normalize_statement("  SELECT 1 FROM dual ;; ") == "SELECT 1 FROM dual"
+@pytest.mark.parametrize("sql, expected", CASES["normalize"])
+def test_normalize(sql, expected):
+    assert normalize_statement(sql) == expected
 
 
-def test_normalize_rejects_empty():
+@pytest.mark.parametrize("sql", CASES["normalize_rejects"])
+def test_normalize_rejects(sql):
     with pytest.raises(ValueError):
-        normalize_statement(" ; ")
+        normalize_statement(sql)
 
 
-@pytest.mark.parametrize("sql", ["DELETE FROM t", "DROP TABLE t", "BEGIN NULL; END", "/* x */ UPDATE t SET a = 1"])
-def test_select_guard_rejects_non_select(sql):
+@pytest.mark.parametrize("sql", CASES["select_rejects"])
+def test_select_rejects(sql):
     with pytest.raises(ValueError):
         ensure_select(sql)
 
 
-@pytest.mark.parametrize("sql", ["DROP TABLE t", "TRUNCATE TABLE t", "SELECT 1 FROM dual", "GRANT SELECT ON t TO u"])
-def test_dml_guard_rejects_non_dml(sql):
+@pytest.mark.parametrize("sql", CASES["select_accepts"])
+def test_select_accepts(sql):
+    ensure_select(sql)
+
+
+@pytest.mark.parametrize("sql", CASES["dml_rejects"])
+def test_dml_rejects(sql):
     with pytest.raises(ValueError):
         ensure_dml(sql)
 
 
-@pytest.mark.parametrize("sql", ["INSERT INTO t VALUES (1)", "update t set a = 1", "MERGE INTO t USING s ON (1=1) WHEN MATCHED THEN UPDATE SET a = 1"])
-def test_dml_guard_accepts_dml(sql):
+@pytest.mark.parametrize("sql", CASES["dml_accepts"])
+def test_dml_accepts(sql):
     ensure_dml(sql)
 
 
-def test_quote_identifier_escapes_quotes():
-    assert quote_identifier('a"b') == '"a""b"'
+@pytest.mark.parametrize("name, expected", CASES["quote_identifier"])
+def test_quote_identifier(name, expected):
+    assert quote_identifier(name) == expected
 
 
-def test_to_json_value():
-    assert to_json_value(Decimal("42")) == 42
-    assert to_json_value(Decimal("1.5")) == 1.5
-    assert to_json_value(Decimal("123456789012345678901234567890")) == "123456789012345678901234567890"
-    assert to_json_value(dt.date(2026, 1, 2)) == "2026-01-02"
-    assert to_json_value(b"\x00\x01") == "base64:AAE="
-    assert to_json_value("x" * 5000).endswith("[truncated 1000 chars]")
+@pytest.mark.parametrize("labels, expected", CASES["unique_labels"])
+def test_unique_labels(labels, expected):
+    assert unique_labels(labels) == expected
+
+
+@pytest.mark.parametrize("text, expected", CASES["decimal"])
+def test_decimal_to_json(text, expected):
+    result = decimal_to_json(Decimal(text))
+    assert result == expected and type(result) is type(expected)
+
+
+def _expand(spec):
+    return spec["repeat"] * spec["count"] + spec.get("suffix", "")
+
+
+@pytest.mark.parametrize("given, expected", CASES["truncate"]["cases"])
+def test_truncate(given, expected):
+    assert MAX_CELL_CHARS == CASES["truncate"]["max_chars"]
+    assert truncate(_expand(given)) == _expand(expected)
+
+
+@pytest.mark.parametrize("value, expected", CASES["env_flag"])
+def test_env_flag(value, expected, monkeypatch):
+    monkeypatch.setenv("SOME_FLAG", value)
+    assert env_flag("SOME_FLAG") is expected

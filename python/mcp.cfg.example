@@ -1,4 +1,5 @@
 # Tibero Database Connection
+# TIBERO_JDBC_JAR=/path/to/tbjdbc17-7.2.6.jar   # default: the single lib/tbjdbc*.jar
 TIBERO_HOST=localhost
 TIBERO_PORT=8629
 TIBERO_DATABASE=tibero
@@ -20,6 +21,9 @@ MCP_HTTP_PATH=/mcp
 # "X-API-Key: <key>", or a path prefix: http://host:8000/<key>/mcp
 MCP_API_KEYS=
 # MCP_ALLOW_ANONYMOUS=true     # only for trusted networks
+
+# Leave out tools that can change data (execute_dml): true/1/yes/on
+MCP_READ_ONLY=false
 
 # Optional DNS-rebinding protection: comma-separated Host values, e.g. mcp.example.com
 MCP_ALLOWED_HOSTS=

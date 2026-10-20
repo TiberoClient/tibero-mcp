@@ -115,6 +115,23 @@ class ExplainResult(BaseModel):
     plan_text: str = Field(description="Indented plan tree for reading")
 
 
+class _LazyConnection:
+    """Connects on first use, so statement checks that fail run before any connection
+    is made, as in the Java server (which borrows from its pool only after them)."""
+
+    def __init__(self) -> None:
+        self._connection: Any = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._connection is None:
+            self._connection = get_connection()
+        return getattr(self._connection, name)
+
+    def close(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+
+
 async def _with_connection(work: Callable[[Any], T]) -> T:
     """Run ``work(connection)`` on a worker thread with a fresh connection.
 
@@ -123,7 +140,7 @@ async def _with_connection(work: Callable[[Any], T]) -> T:
     """
 
     def run() -> T:
-        connection = get_connection()
+        connection = _LazyConnection()
         try:
             return work(connection)
         finally:
@@ -272,6 +289,20 @@ async def sample_table(
         return QueryResult(columns=columns, rows=rows, row_count=len(rows), truncated=False)
 
     return await _with_connection(work)
+
+
+def apply_read_only(read_only: bool) -> list[str]:
+    """In read-only mode drop every tool not annotated read-only, so clients never see it.
+
+    Returns the removed tool names. The same rule (keep only readOnlyHint=true) is
+    applied by the Java server, which keeps both tool lists identical.
+    """
+    if not read_only:
+        return []
+    removed = [tool.name for tool in mcp._tool_manager.list_tools() if not (tool.annotations and tool.annotations.read_only_hint)]
+    for name in removed:
+        mcp.remove_tool(name)
+    return removed
 
 
 def get_server() -> MCPServer:

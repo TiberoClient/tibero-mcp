@@ -44,18 +44,22 @@ class TiberoConnection:
         self.connection = None
 
     def _find_jdbc_jar(self) -> str:
-        """Find JDBC driver JAR file."""
-        # python/ 디렉토리 기준으로 lib/ 찾기
-        project_root = Path(__file__).parent.parent.parent
-        lib_dir = project_root / "lib"
-        
-        # Look for tbjdbc8 JAR files
-        jar_files = list(lib_dir.glob("tbjdbc8*.jar"))
-        if jar_files:
-            return str(jar_files[0])
+        """Find the JDBC driver: TIBERO_JDBC_JAR, else the single tbjdbc*.jar in lib/.
 
+        The Java server uses com.tmaxtibero:tbjdbc17 at the same version (see
+        java/build.gradle and the Dockerfile), so both read values through one driver.
+        """
+        explicit = os.getenv("TIBERO_JDBC_JAR")
+        if explicit:
+            return explicit
+        lib_dir = Path(__file__).parent.parent.parent / "lib"
+        jar_files = sorted(lib_dir.glob("tbjdbc*.jar"))
+        if len(jar_files) == 1:
+            return str(jar_files[0])
+        if jar_files:
+            raise FileNotFoundError(f"Several Tibero JDBC drivers in {lib_dir}: {[p.name for p in jar_files]}; keep one")
         raise FileNotFoundError(
-            f"Tibero JDBC driver not found. Please download it to {lib_dir}"
+            f"Tibero JDBC driver not found. Download com.tmaxtibero:tbjdbc17 to {lib_dir} or set TIBERO_JDBC_JAR"
         )
 
     def connect(self):

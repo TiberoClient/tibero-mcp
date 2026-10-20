@@ -22,14 +22,16 @@ MCP SDK 2.x(`MCPServer`, 프로토콜 2026-07-28) 기반이다. 모든 도구에
 - 표 이름은 정확한 이름 → 대문자 순으로 찾는다(따옴표 없이 만든 이름은 대문자로 저장된다)
 - 긴 셀 값은 `TIBERO_MAX_CELL_CHARS`(기본 4000자)에서 자른다
 - JDBC 호출은 워커 스레드에서 돌아 이벤트 루프를 막지 않는다
-- 도구 annotations 는 힌트일 뿐이다. 실제 쓰기 차단은 **DB 계정 권한**으로 건다(읽기 전용 계정 권장)
+- **`MCP_READ_ONLY=true`** 면 `readOnlyHint` 가 아닌 도구(`execute_dml`)를 아예 등록하지 않는다 — 클라이언트 목록에도 안 보인다
+- 도구 annotations 는 힌트일 뿐이다. 실제 쓰기 차단은 **DB 계정 권한**으로 건다(읽기 전용 계정 + `MCP_READ_ONLY` 권장)
+- Java 구현(`../java`)과 기능이 같다 — 도구 정의는 `../spec/tools.json` 하나를 공유하고 `../spec/conformance` 테스트가 두 서버를 함께 띄워 비교한다
 
 ## 요구사항
 
 - Python 3.12 이상 (Docker 이미지는 3.13)
-- Java JDK 8 이상 (JDBC 드라이버 실행용)
+- Java 17 이상 (JDBC 드라이버 실행용)
 - Tibero DBMS
-- Tibero JDBC 드라이버 (tbjdbc8*.jar)
+- Tibero JDBC 드라이버 (tbjdbc17-7.2.6.jar)
 
 ## 설치
 
@@ -48,10 +50,13 @@ pip install -r requirements.txt
 
 ### 3. JDBC 드라이버 준비
 
-Tibero JDBC 드라이버를 `lib/` 디렉토리에 배치하세요:
+Java 구현과 같은 드라이버(`com.tmaxtibero:tbjdbc17:7.2.6`, Maven Central)를 `lib/` 에 하나만 둔다(또는 `TIBERO_JDBC_JAR` 로 경로 지정).
 
-- 파일: `lib/tbjdbc8-7.2.4.jar` (또는 `tbjdbc8*.jar` 패턴의 파일)
-- JDBC 드라이버는 Tibero 설치 디렉토리에서 찾을 수 있습니다
+```bash
+curl -o lib/tbjdbc17-7.2.6.jar https://repo1.maven.org/maven2/com/tmaxtibero/tbjdbc17/7.2.6/tbjdbc17-7.2.6.jar
+```
+
+Docker 이미지는 빌드 때 같은 jar 를 받아 SHA-256 으로 확인한다. JDBC 를 돌리려면 Java 17 이상이 필요하다.
 
 ### 4. 환경 변수 설정
 
@@ -79,7 +84,7 @@ HTTP 모드에서 루프백이 아닌 주소로 열면 `MCP_API_KEYS` 가 필수
 ## Docker
 
 ```bash
-docker build -t tibero-mcp .          # lib/tbjdbc8*.jar 가 있어야 한다
+docker build -t tibero-mcp .          # 드라이버는 빌드 때 Maven Central 에서 받는다
 docker run -d -p 8000:8000 --env-file mcp.env tibero-mcp
 curl http://localhost:8000/healthz    # 인증 없이 열리는 유일한 경로
 ```
@@ -187,7 +192,7 @@ python/
 │   │   └── server.py            # MCPServer 와 도구 정의
 │   └── main.py                  # 진입점
 ├── lib/                         # JDBC 드라이버
-│   └── tbjdbc8-7.2.4.jar
+│   └── tbjdbc17-7.2.6.jar (추적 안 함)
 ├── mcp.cfg.example              # 설정 파일 예제
 ├── tests/                       # 단위 테스트(SQL 가드·인증), DB 불필요
 ├── Dockerfile
@@ -206,7 +211,7 @@ python/
 
 ### JDBC 드라이버 오류
 
-- `lib/` 디렉토리에 `tbjdbc8*.jar` 파일이 있는지 확인하세요
+- `lib/` 에 `tbjdbc*.jar` 가 하나만 있는지(또는 `TIBERO_JDBC_JAR`) 확인하세요
 - Java JDK가 설치되어 있고 `JAVA_HOME`이 설정되어 있는지 확인하세요
 
 ### 권한 오류

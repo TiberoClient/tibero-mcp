@@ -111,7 +111,7 @@ async def run_http_server():
     port = int(os.getenv("MCP_SERVER_PORT", "8000"))
 
     if not _api_keys():
-        if host not in ("127.0.0.1", "localhost", "::1") and os.getenv("MCP_ALLOW_ANONYMOUS", "").lower() != "true":
+        if host not in ("127.0.0.1", "localhost", "::1") and not env_flag("MCP_ALLOW_ANONYMOUS"):
             logger.error(
                 "MCP_API_KEYS is empty while listening on a non-loopback address. "
                 "Set MCP_API_KEYS, or MCP_ALLOW_ANONYMOUS=true to run without authentication."
@@ -135,10 +135,20 @@ async def run_http_server():
     await server.serve()
 
 
+def env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main():
-    """Main entry point using FastMCP."""
+    """Main entry point."""
     setup_logging()
     validate_environment()
+
+    from .mcp.server import apply_read_only
+
+    removed = apply_read_only(env_flag("MCP_READ_ONLY"))
+    if removed:
+        logger.info(f"Read-only mode: tools not registered: {', '.join(removed)}")
     
     # Determine transport mode from environment or default to http
     transport = os.getenv("MCP_TRANSPORT", "http").lower()

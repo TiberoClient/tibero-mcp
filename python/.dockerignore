@@ -2,3 +2,4 @@
 mcp.cfg
 **/__pycache__
 tests
+lib

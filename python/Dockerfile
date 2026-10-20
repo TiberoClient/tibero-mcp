@@ -13,7 +13,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY lib/ lib/
+# Same driver and version as the Java server (com.tmaxtibero:tbjdbc17 in java/build.gradle).
+ARG TBJDBC_VERSION=7.2.6
+ARG TBJDBC_SHA256=2e8ad3e9bdb8bfb8c2cdc03692f504e3f43c8b7f7c546fc705ffb37785425de2
+RUN mkdir lib && python -c "import urllib.request; urllib.request.urlretrieve('https://repo1.maven.org/maven2/com/tmaxtibero/tbjdbc17/${TBJDBC_VERSION}/tbjdbc17-${TBJDBC_VERSION}.jar', 'lib/tbjdbc17-${TBJDBC_VERSION}.jar')" \
+    && echo "${TBJDBC_SHA256}  lib/tbjdbc17-${TBJDBC_VERSION}.jar" | sha256sum -c -
+
 COPY src/ src/
 
 RUN useradd --system --uid 10001 --no-create-home mcp
