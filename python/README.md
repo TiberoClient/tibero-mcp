@@ -4,46 +4,29 @@ Tibero DBMS를 위한 MCP(Model Context Protocol) 서버입니다. Python으로 
 
 ## 주요 기능
 
-이 MCP 서버는 다음과 같은 도구들을 제공합니다:
+MCP SDK 2.x(`MCPServer`, 프로토콜 2026-07-28) 기반이다. 모든 도구에 MCP tool annotations
+(`readOnlyHint`·`destructiveHint`·`idempotentHint`·`openWorldHint`·`title`)와 반환 모델이 선언돼 있어
+클라이언트는 `outputSchema` 와 `structuredContent` 를 함께 받는다. DB 오류는 `isError` 결과로 Tibero
+메시지(예: `JDBC-8026`)를 그대로 돌려줘 모델이 SQL 을 고칠 수 있다.
 
-### 1. **execute_query** - SELECT 쿼리 실행
-- SELECT 쿼리를 실행하고 결과를 JSON 배열로 반환
-- 파라미터화된 쿼리 지원
-- 모든 행을 딕셔너리 형태로 반환
+| 도구 | 성격 | 설명 |
+|---|---|---|
+| `execute_query` | 읽기 | SELECT / WITH 만 허용. `max_rows`(기본 200, 최대 5000) 초과 시 `truncated: true` |
+| `execute_dml` | 쓰기(파괴적) | INSERT·UPDATE·DELETE·MERGE 한 문장을 단독 트랜잭션으로 커밋. DDL 거부. `dry_run=true` 면 영향 행 수만 보고 롤백 |
+| `get_schema` | 읽기 | 표·뷰 목록과 주석·통계 행 수. 스키마를 생략하면 시스템 스키마(`TIBERO_SYSTEM_SCHEMAS`)를 뺀 전체 |
+| `get_table_info` | 읽기 | 컬럼·주석, 제약(PK·FK 의 참조 테이블/컬럼·UNIQUE·CHECK), 인덱스 컬럼 |
+| `explain_plan` | 읽기 | `PLAN_TABLE` 기반 실행계획(Tibero 에는 `DBMS_XPLAN` 이 없다). 한 트랜잭션에서 만들고 읽은 뒤 롤백 |
+| `sample_table` | 읽기 | 앞쪽 n 행(기본 10, 최대 1000) |
 
-### 2. **execute_dml** - DML 문 실행
-- INSERT, UPDATE, DELETE 문 실행
-- 자동 트랜잭션 관리 (성공 시 커밋, 실패 시 롤백)
-- 영향받은 행 수 반환
-
-### 3. **get_schema** - 스키마 정보 조회
-- 데이터베이스의 모든 테이블과 뷰 목록 조회
-- 각 테이블/뷰의 comment 포함
-- 특정 스키마로 필터링 가능
-- 테이블스페이스, 행 수, 마지막 분석 날짜 등 메타데이터 포함
-
-### 4. **get_table_info** - 테이블/뷰 상세 정보
-- 특정 테이블 또는 뷰의 상세 정보 조회
-- **컬럼 정보**: 이름, 데이터 타입, 길이, 정밀도, NULL 허용 여부, 기본값, **컬럼 comment**
-- **제약 조건**: 제약 이름, 타입, 상태 등
-- **인덱스**: 인덱스 이름, 타입, 유일성, 상태 등
-- 테이블과 뷰 모두 지원 (뷰의 경우 제약조건/인덱스는 보통 빈 배열)
-
-### 5. **explain_plan** - 실행 계획 조회
-- SQL 쿼리의 실행 계획을 실제 실행 없이 분석
-- 실행 가능한 SQL인지 검증
-- 실행 계획 상세 정보 반환 (DBMS_XPLAN.DISPLAY 또는 PLAN_TABLE 사용)
-- SQL이 유효하지 않은 경우 에러 메시지 반환
-
-### 6. **sample_table** - 테이블 샘플링
-- 특정 테이블에서 n개의 행을 샘플링
-- 전체 데이터를 로드하지 않고 필요한 행만 조회
-- 기본값: 10개, 최대값: 1000개
-- 테이블 구조와 데이터를 빠르게 확인하는 데 유용
+- 문장 끝 `;` 는 떼고 실행한다. 모든 문장에 서버측 타임아웃(`TIBERO_QUERY_TIMEOUT`, 기본 60초)을 건다
+- 표 이름은 정확한 이름 → 대문자 순으로 찾는다(따옴표 없이 만든 이름은 대문자로 저장된다)
+- 긴 셀 값은 `TIBERO_MAX_CELL_CHARS`(기본 4000자)에서 자른다
+- JDBC 호출은 워커 스레드에서 돌아 이벤트 루프를 막지 않는다
+- 도구 annotations 는 힌트일 뿐이다. 실제 쓰기 차단은 **DB 계정 권한**으로 건다(읽기 전용 계정 권장)
 
 ## 요구사항
 
-- Python 3.12 이상
+- Python 3.12 이상 (Docker 이미지는 3.13)
 - Java JDK 8 이상 (JDBC 드라이버 실행용)
 - Tibero DBMS
 - Tibero JDBC 드라이버 (tbjdbc8*.jar)
@@ -72,32 +55,38 @@ Tibero JDBC 드라이버를 `lib/` 디렉토리에 배치하세요:
 
 ### 4. 환경 변수 설정
 
-`mcp.cfg.example` 파일을 복사하여 `mcp.cfg` 파일을 생성하고 데이터베이스 연결 정보를 입력하세요:
+`mcp.cfg.example` 을 `mcp.cfg` 로 복사해 채운다(환경 변수가 있으면 그쪽이 우선). 항목 설명은 예제 파일 주석에 있다.
 
 ```bash
-# Windows
-copy mcp.cfg.example mcp.cfg
-
-# Linux/Mac
 cp mcp.cfg.example mcp.cfg
 ```
 
-`mcp.cfg` 파일을 편집하여 Tibero 데이터베이스 연결 정보를 설정하세요:
+## 인증
 
-```ini
-# Tibero Database Connection
-TIBERO_HOST=your_host
-TIBERO_PORT=8629
-TIBERO_DATABASE=your_database
-TIBERO_USER=your_username
-TIBERO_PASSWORD=your_password
+HTTP 모드에서 루프백이 아닌 주소로 열면 `MCP_API_KEYS` 가 필수다(없으면 기동하지 않는다.
+신뢰망 한정으로 `MCP_ALLOW_ANONYMOUS=true`). 같은 키를 세 곳 중 아무 데나 실어 보내면 된다:
 
-# MCP Server Configuration
-MCP_TRANSPORT=http          # http (기본값) 또는 stdio
-MCP_SERVER_HOST=0.0.0.0     # 0.0.0.0: 모든 인터페이스, localhost: 로컬만
-MCP_SERVER_PORT=8000        # HTTP 서버 포트
-LOG_LEVEL=INFO
+| 방식 | 예 | 쓰는 곳 |
+|---|---|---|
+| `Authorization: Bearer <키>` | 헤더 | Claude 커스텀 커넥터 "Request headers", Claude Code, Cursor |
+| `X-API-Key: <키>` | 헤더 | 사용자 정의 헤더만 받는 클라이언트 |
+| 경로 키 | `https://host/<키>/mcp` | URL 만 받는 클라이언트(ChatGPT 커넥터 "No authentication" 등) |
+
+경로 키는 URL 에 남으므로 서버 접근 로그는 키를 `/<key>/` 로 가려 찍고(uvicorn 기본 접근 로그는 끈다),
+앞단 프록시에서도 그 location 의 access log 를 꺼야 한다. 키는 `openssl rand -hex 32` 로 만들고,
+교체할 때는 쉼표로 새 키를 함께 넣었다가 옛 키를 뺀다.
+
+## Docker
+
+```bash
+docker build -t tibero-mcp .          # lib/tbjdbc8*.jar 가 있어야 한다
+docker run -d -p 8000:8000 --env-file mcp.env tibero-mcp
+curl http://localhost:8000/healthz    # 인증 없이 열리는 유일한 경로
 ```
+
+서버는 stateless Streamable HTTP + JSON 응답으로 동작한다 — 요청마다 독립이라 리버스 프록시 뒤나
+재시작 뒤에도 세션이 끊기지 않는다. 프록시에 경로 접두사를 붙이면(`location /tiberomcp/ { proxy_pass http://…:8000/; }`)
+엔드포인트는 `https://host/tiberomcp/mcp` 가 된다.
 
 ## 실행
 
@@ -146,7 +135,8 @@ Server will communicate via stdin/stdout
 {
   "mcpServers": {
     "tibero": {
-      "url": "http://your-server-ip:8000/mcp"
+      "url": "http://your-server-ip:8000/mcp",
+      "headers": { "Authorization": "Bearer <MCP_API_KEYS 의 키>" }
     }
   }
 }
@@ -193,12 +183,16 @@ python/
 │   │   └── schema_viewer.py     # 스키마 정보 조회
 │   ├── mcp/                     # MCP 서버
 │   │   ├── __init__.py
-│   │   └── server.py            # FastMCP 서버 및 도구 정의
+│   │   ├── auth.py              # API 키 인증·키를 가린 접근 로그
+│   │   └── server.py            # MCPServer 와 도구 정의
 │   └── main.py                  # 진입점
 ├── lib/                         # JDBC 드라이버
 │   └── tbjdbc8-7.2.4.jar
 ├── mcp.cfg.example              # 설정 파일 예제
-├── requirements.txt             # Python 의존성
+├── tests/                       # 단위 테스트(SQL 가드·인증), DB 불필요
+├── Dockerfile
+├── requirements.txt             # Python 의존성(== 고정)
+├── requirements-dev.txt         # + pytest
 └── README.md                    # 이 파일
 ```
 

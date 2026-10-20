@@ -1,0 +1,4 @@
+.venv
+mcp.cfg
+**/__pycache__
+tests

@@ -1,569 +1,279 @@
-"""MCP server implementation for Tibero database using FastMCP.
+"""MCP server implementation for Tibero database.
 
-This MCP (Model Context Protocol) server provides tools for interacting with Tibero DBMS.
-It enables AI assistants to query, analyze, and manage Tibero databases through a standardized
-protocol interface.
+Tools are declared with MCP tool annotations (read-only / destructive / idempotent /
+open-world hints) and typed return models, so clients receive both an
+``outputSchema`` and ``structuredContent`` in addition to the JSON text block.
 
-**Key Features:**
-- Execute SELECT queries and DML statements (INSERT, UPDATE, DELETE)
-- Retrieve schema and table information with detailed metadata
-- Analyze SQL execution plans without executing queries
-- Sample table data for quick inspection
-- Automatic transaction management for data safety
-
-**Best Practices:**
-- Always use explain_plan before executing queries or DML statements to validate SQL syntax
-  and verify that the statement matches your intended logic
-- Use double quotes for case-sensitive table/column names (e.g., "atom", "Country")
-- Check table structure with get_table_info before writing complex queries
-
-This module defines MCP tools using @mcp.tool() decorators.
-All business logic is implemented in this module.
+Database calls go through blocking JDBC, so every tool hands its work to a worker
+thread instead of stalling the event loop that serves other clients.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+import anyio
 from loguru import logger
+from pydantic import BaseModel, Field
 
-try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:
-    logger.error("MCP SDK not available. Please install with: pip install 'mcp[cli]>=1.21.1'")
-    raise
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ToolAnnotations
 
+from .. import __version__
 from ..db import (
-    get_connection,
-    execute_select_query_and_fetch_results,
     execute_dml_statement_with_transaction_management,
+    get_connection,
     get_execution_plan,
-    sample_table_rows,
     get_schema_info,
     get_table_columns,
     get_table_constraints,
     get_table_indexes,
+    resolve_object,
+    run_select,
+    sample_table_rows,
 )
 
+INSTRUCTIONS = """\
+Tools for a Tibero (Oracle-compatible) relational database.
 
-# Create FastMCP server instance
-# This server provides database tools for Tibero DBMS including query execution,
-# schema inspection, execution plan analysis, and data sampling.
-# Before executing queries or DML statements, it's recommended to use explain_plan
-# to validate SQL syntax and verify intended logic.
-mcp = FastMCP("tibero-mcp-server")
+Recommended workflow:
+1. get_schema to find tables and views (optionally for one schema).
+2. get_table_info for columns, comments, primary/foreign keys and indexes before writing joins.
+3. sample_table to see real values, then execute_query for the actual question.
+4. explain_plan to validate a statement without running it.
+
+SQL dialect is Oracle-compatible: use ROWNUM or FETCH FIRST n ROWS ONLY to limit rows,
+NVL/DECODE/TO_CHAR/TO_DATE, and qualify tables as SCHEMA.TABLE. Unquoted identifiers are
+upper-case; only quote names that were created mixed-case. Do not end statements with ';'.
+"""
+
+mcp = MCPServer(
+    name="tibero-mcp-server",
+    title="Tibero Database",
+    version=__version__,
+    instructions=INSTRUCTIONS,
+)
+
+READ_ONLY = dict(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
+
+T = TypeVar("T")
 
 
-@mcp.tool()
-async def execute_query_jsonl(query: str) -> str:
+class QueryResult(BaseModel):
+    columns: list[str] = Field(description="Column names in select-list order")
+    rows: list[dict[str, Any]] = Field(description="One object per row, keyed by column name")
+    row_count: int = Field(description="Number of rows returned")
+    truncated: bool = Field(description="True when more rows existed than max_rows; narrow or aggregate the query")
+
+
+class DmlResult(BaseModel):
+    rowcount: int = Field(description="Rows inserted, updated or deleted")
+    committed: bool = Field(description="False when dry_run rolled the change back")
+
+
+class SchemaObject(BaseModel):
+    schema_name: str
+    object_name: str = Field(description="Exact dictionary name (case-sensitive)")
+    object_type: str = Field(description="TABLE or VIEW")
+    num_rows: int | None = Field(None, description="Row count from the last statistics run, if any")
+    last_analyzed: str | None = None
+    comments: str | None = None
+
+
+class SchemaResult(BaseModel):
+    objects: list[SchemaObject]
+    count: int
+
+
+class TableInfo(BaseModel):
+    schema_name: str
+    table_name: str
+    object_type: str = Field(description="TABLE or VIEW")
+    comments: str | None = None
+    columns: list[dict[str, Any]]
+    constraints: list[dict[str, Any]] = Field(description="PK (P), FK (R, with REFERENCES), unique (U) and check (C) constraints")
+    indexes: list[dict[str, Any]]
+
+
+class PlanStep(BaseModel):
+    id: int
+    parent_id: int | None = None
+    depth: int | None = None
+    operation: str | None = None
+    object_owner: str | None = None
+    object_name: str | None = None
+    cost: float | None = None
+    cardinality: float | None = None
+    access_predicates: str | None = None
+    filter_predicates: str | None = None
+
+
+class ExplainResult(BaseModel):
+    steps: list[PlanStep]
+    total_cost: float | None = Field(None, description="Cost of the root step")
+    plan_text: str = Field(description="Indented plan tree for reading")
+
+
+async def _with_connection(work: Callable[[Any], T]) -> T:
+    """Run ``work(connection)`` on a worker thread with a fresh connection.
+
+    Database errors are surfaced as ToolError so the model sees the Tibero message
+    (e.g. JDBC-8026 invalid identifier) and can correct its SQL.
     """
-    Execute a SELECT query on the Tibero database and return results.
-    
-    **IMPORTANT: Before executing a query, it is strongly recommended to first use the 
-    explain_plan tool to validate the SQL syntax and verify that the query matches your 
-    intended logic. This helps catch errors and semantic issues before actual execution.**
-    
-    This tool is designed for SELECT queries that return result sets.
-    It executes the query and returns all rows in JSONL format (one JSON object per line).
-    
-    Note: Table, view, and column names are case-sensitive. If they were created with
-    quoted identifiers (e.g., "atom", "Country", "Player_Attributes"), you must use
-    double quotes around the names in your SQL query to preserve case sensitivity.
-    Example: SELECT * FROM "atom" WHERE "atom_id" = '123'
-    
-    Args:
-        query: SELECT SQL query to execute (use double quotes for case-sensitive identifiers)
-        
-    Returns:
-        JSONL string where:
-        - First line contains metadata: {"success": true, "row_count": N}
-        - Subsequent lines contain data rows (each row is a dictionary with column names as keys)
-        - Rows are separated by newline characters
-        - On error, returns a single line with success: false, error message, and row_count: 0
-    """
-    logger.info(f"Executing SELECT query: {query[:100]}...")
-    try:
+
+    def run() -> T:
         connection = get_connection()
         try:
-            results = execute_select_query_and_fetch_results(connection, query)
-            # First line: metadata with success and row_count
-            jsonl_lines = []
-            metadata = {
-                "success": True,
-                "row_count": len(results),
-            }
-            jsonl_lines.append(json.dumps(metadata, ensure_ascii=False))
-            
-            # Write each row as a separate JSON object (JSONL format)
-            for row in results:
-                jsonl_lines.append(json.dumps(row, ensure_ascii=False))
-            return "\n".join(jsonl_lines) + "\n"
+            return work(connection)
         finally:
             connection.close()
-    except Exception as e:
-        logger.error(f"SELECT query execution failed: {e}")
-        # On error, return error info as JSONL
-        error_row = {
-            "success": False,
-            "error": str(e),
-            "query": query,
-        }
-        return json.dumps(error_row, ensure_ascii=False) + "\n"
 
-
-@mcp.tool()
-async def execute_query_md(query: str) -> str:
-    """
-    Execute a SELECT query on the Tibero database and return results as a Markdown table.
-    
-    **IMPORTANT: Before executing a query, it is strongly recommended to first use the 
-    explain_plan tool to validate the SQL syntax and verify that the query matches your 
-    intended logic. This helps catch errors and semantic issues before actual execution.**
-    
-    This tool is designed for SELECT queries that return result sets.
-    It executes the query and returns all rows as a Markdown-formatted table.
-    
-    Note: Table, view, and column names are case-sensitive. If they were created with
-    quoted identifiers (e.g., "atom", "Country", "Player_Attributes"), you must use
-    double quotes around the names in your SQL query to preserve case sensitivity.
-    Example: SELECT * FROM "atom" WHERE "atom_id" = '123'
-    
-    Args:
-        query: SELECT SQL query to execute (use double quotes for case-sensitive identifiers)
-        
-    Returns:
-        Markdown table string with:
-        - Header row with column names
-        - Separator row
-        - Data rows with values
-        - On error, returns error message in Markdown format
-    """
-    logger.info(f"Executing SELECT query (MD format): {query[:100]}...")
     try:
-        connection = get_connection()
-        try:
-            results = execute_select_query_and_fetch_results(connection, query)
-            
-            if not results:
-                return "**Query executed successfully.**\n\n*No rows returned.*\n"
-            
-            # Get column names from first row
-            columns = list(results[0].keys())
-            
-            # Build header row
-            md_lines = []
-            header = "| " + " | ".join(escape_markdown(str(col)) for col in columns) + " |"
-            md_lines.append(header)
-            
-            # Build separator row
-            separator = "|" + "|".join("---" for _ in columns) + "|"
-            md_lines.append(separator)
-            
-            # Build data rows
-            for row in results:
-                row_values = []
-                for col in columns:
-                    value = row.get(col)
-                    cell_value = "" if value is None else escape_markdown(str(value))
-                    row_values.append(cell_value)
-                data_row = "| " + " | ".join(row_values) + " |"
-                md_lines.append(data_row)
-            
-            return "\n".join(md_lines) + "\n"
-        finally:
-            connection.close()
-    except Exception as e:
-        logger.error(f"SELECT query execution failed: {e}")
-        return f"**Error executing query:**\n\n```\n{str(e)}\n```\n"
+        return await anyio.to_thread.run_sync(run)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    except Exception as exc:
+        message = str(exc) or exc.__class__.__name__
+        logger.warning(f"Database call failed: {message}")
+        raise ToolError(f"Database error: {message}") from exc
 
 
-def escape_markdown(text: str) -> str:
-    """Escape special characters for Markdown table."""
-    if not text:
-        return ""
-    # Escape pipe characters and newlines for Markdown table
-    return text.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+@mcp.tool(title="Run SELECT query", annotations=ToolAnnotations(title="Run SELECT query", **READ_ONLY))
+async def execute_query(
+    query: str = Field(description="A single SELECT or WITH ... SELECT statement, without a trailing ';'"),
+    max_rows: int = Field(200, ge=1, le=5000, description="Maximum rows to return"),
+) -> QueryResult:
+    """Run a read-only SELECT statement and return its rows.
 
-
-def _convert_execution_plan_to_markdown(plan: list[dict[str, Any]]) -> str:
+    Only SELECT/WITH statements are accepted; use execute_dml for data changes.
+    If the result is truncated, aggregate or filter in SQL rather than raising max_rows.
     """
-    Convert execution plan data to Markdown format.
-    
-    This is an internal helper function used only by the explain_plan tool.
-
-    Args:
-        plan: List of dictionaries representing execution plan rows
-
-    Returns:
-        Markdown formatted string
-    """
-    if not plan:
-        return "**Execution plan is empty.**\n"
-
-    md_lines = []
-    in_table = False
-    table_rows = []
-    header_line = None
-
-    for row in plan:
-        column_value = row.get("COLUMN_VALUE")
-        if column_value is None:
-            continue
-
-        line = str(column_value).strip()
-
-        # Skip empty lines
-        if not line:
-            if in_table and table_rows:
-                # Flush table
-                md_lines.append(_build_markdown_table(header_line, table_rows))
-                table_rows = []
-                in_table = False
-            md_lines.append("")
-            continue
-
-        # Check if this is a table header line (contains "|" and "Operation")
-        if "|" in line and "Operation" in line:
-            in_table = True
-            header_line = line
-            table_rows = []
-            continue
-
-        # Check if this is a separator line
-        if in_table and line.replace("|", "").replace("-", "").strip() == "":
-            continue
-
-        # Check if this is a table data row
-        if in_table and "|" in line and line.replace("|", "").replace("-", "").strip() != "":
-            table_rows.append(line)
-            continue
-
-        # If we were in a table and hit a non-table line, flush the table
-        if in_table and "|" not in line:
-            md_lines.append(_build_markdown_table(header_line, table_rows))
-            table_rows = []
-            in_table = False
-
-        # Regular text line
-        if line.startswith("Note") or line.startswith("---"):
-            md_lines.append(line)
-        elif "SQL" in line and ":" in line:
-            # SQL section - format as bold
-            md_lines.append(f"**{line}**")
-            md_lines.append("")
-        elif line:
-            md_lines.append(line)
-
-    # Flush any remaining table
-    if in_table and table_rows:
-        md_lines.append(_build_markdown_table(header_line, table_rows))
-
-    return "\n".join(md_lines) + "\n"
+    logger.info(f"execute_query: {query[:200]}")
+    return QueryResult(**await _with_connection(lambda conn: run_select(conn, query, max_rows)))
 
 
-def _build_markdown_table(header_line: str | None, data_rows: list[str]) -> str:
-    """Build a Markdown table from parsed table rows."""
-    if not header_line or not data_rows:
-        return ""
-
-    table_lines = []
-
-    # Parse header
-    header_cells = _parse_table_row(header_line)
-    table_lines.append("| " + " | ".join(header_cells) + " |")
-
-    # Build separator
-    table_lines.append("|" + "|".join([" --- "] * len(header_cells)) + "|")
-
-    # Add data rows
-    for row in data_rows:
-        cells = _parse_table_row(row)
-        # Pad or truncate cells to match header length
-        while len(cells) < len(header_cells):
-            cells.append("")
-        cells = cells[:len(header_cells)]
-        table_lines.append("| " + " | ".join(cells) + " |")
-
-    return "\n".join(table_lines)
-
-
-def _parse_table_row(row: str) -> list[str]:
-    """Parse a table row string into individual cells."""
-    cleaned = row.strip()
-    if cleaned.startswith("|"):
-        cleaned = cleaned[1:]
-    if cleaned.endswith("|"):
-        cleaned = cleaned[:-1]
-    parts = cleaned.split("|")
-    return [part.strip() for part in parts]
-
-
-@mcp.tool()
+@mcp.tool(
+    title="Run INSERT/UPDATE/DELETE",
+    annotations=ToolAnnotations(
+        title="Run INSERT/UPDATE/DELETE",
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=False,
+    ),
+)
 async def execute_dml(
-    query: str,
-    auto_commit: bool = True,
-) -> str:
+    query: str = Field(description="One INSERT, UPDATE, DELETE or MERGE statement, without a trailing ';'"),
+    dry_run: bool = Field(False, description="Execute and report the affected row count, then roll back"),
+) -> DmlResult:
+    """Execute one DML statement in its own transaction and commit it.
+
+    DDL (CREATE/DROP/ALTER/TRUNCATE...) is rejected. Run with dry_run=true first when
+    the statement could touch many rows. Writes succeed only where the connected
+    database account has privileges.
     """
-    Execute a DML statement (INSERT, UPDATE, DELETE) on the Tibero database.
-    
-    **IMPORTANT: Before executing a DML statement, it is strongly recommended to first use 
-    the explain_plan tool to validate the SQL syntax and verify that the statement matches 
-    your intended logic. This helps catch errors and prevent unintended data modifications 
-    before actual execution.**
-    
-    This tool is specifically designed for Data Manipulation Language statements
-    and returns the number of affected rows. The transaction is automatically
-    committed on success (unless auto_commit is False) and rolled back on error.
-    
-    Note: Table, view, and column names are case-sensitive. If they were created with
-    quoted identifiers (e.g., "atom", "Country", "Player_Attributes"), you must use
-    double quotes around the names in your SQL statement to preserve case sensitivity.
-    Example: INSERT INTO "atom" ("atom_id", "molecule_id") VALUES ('123', '456')
-    
-    Args:
-        query: DML statement to execute (INSERT, UPDATE, DELETE) (use double quotes for case-sensitive identifiers)
-        auto_commit: Whether to automatically commit the transaction (default: True)
-        
-    Returns:
-        JSON string with execution result containing:
-        - success: Whether the DML statement executed successfully
-        - rowcount: Number of rows affected by the statement
-    """
-    logger.info(f"Executing DML statement: {query[:100]}...")
-    try:
-        connection = get_connection()
-        try:
-            result = execute_dml_statement_with_transaction_management(
-                connection, query, auto_commit
-            )
-            result["success"] = True
-        finally:
-            connection.close()
-    except Exception as e:
-        logger.error(f"DML statement execution failed: {e}")
-        result = {
-            "success": False,
-            "error": str(e),
-            "query": query,
-        }
-        if auto_commit is not None:
-            result["auto_commit"] = auto_commit
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    logger.info(f"execute_dml (dry_run={dry_run}): {query[:200]}")
+    return DmlResult(
+        **await _with_connection(
+            lambda conn: execute_dml_statement_with_transaction_management(conn, query, dry_run)
+        )
+    )
 
 
-@mcp.tool()
-async def get_schema(schema_name: str | None = None) -> str:
-    """
-    Get schema information for the database including tables and views with comments.
-    
-    Note: Table and view names returned in OBJECT_NAME are case-sensitive as defined
-    in the schema. If a table/view was created with quoted identifiers (e.g., "atom",
-    "Country", "Player_Attributes"), the OBJECT_NAME will reflect the exact case.
-    When using these names in other tools, use the exact case as shown in OBJECT_NAME.
-    
-    Args:
-        schema_name: Optional schema name to filter results
-        
-    Returns:
-        JSON string with schema information (tables and views) including:
-        - SCHEMA_NAME: Schema/owner name
-        - OBJECT_NAME: Table or view name (case-sensitive, exact case as in schema)
-        - OBJECT_TYPE: 'TABLE' or 'VIEW'
-        - TABLESPACE_NAME: Tablespace name (for tables only)
-        - NUM_ROWS: Number of rows (for tables only)
-        - LAST_ANALYZED: Last analyzed date (for tables only)
-        - COMMENTS: Comment text for the table or view
-    """
-    logger.info(f"Getting schema info for: {schema_name or 'all'}")
-    try:
-        connection = get_connection()
-        try:
-            schema_info = get_schema_info(connection, schema_name)
-            result = {
-                "success": True,
-                "schema": schema_info,
-                "count": len(schema_info),
-            }
-        finally:
-            connection.close()
-    except Exception as e:
-        logger.error(f"Failed to get schema: {e}")
-        result = {
-            "success": False,
-            "error": str(e),
-        }
-        if schema_name is not None:
-            result["schema_name"] = schema_name
-    return json.dumps(result, ensure_ascii=False, indent=2)
+@mcp.tool(title="List tables and views", annotations=ToolAnnotations(title="List tables and views", **READ_ONLY))
+async def get_schema(
+    schema_name: str | None = Field(None, description="Schema (owner) to list; omit for every non-system schema"),
+) -> SchemaResult:
+    """List tables and views visible to this account, with comments and row-count statistics."""
+    rows = await _with_connection(lambda conn: get_schema_info(conn, schema_name))
+    objects = [
+        SchemaObject(
+            schema_name=row["SCHEMA_NAME"],
+            object_name=row["OBJECT_NAME"],
+            object_type=row["OBJECT_TYPE"],
+            num_rows=row["NUM_ROWS"],
+            last_analyzed=row["LAST_ANALYZED"],
+            comments=row["COMMENTS"],
+        )
+        for row in rows
+    ]
+    return SchemaResult(objects=objects, count=len(objects))
 
 
-@mcp.tool()
-async def get_table_info(schema_name: str, table_name: str) -> str:
-    """
-    Get detailed information about a specific table or view.
-    
-    This tool works for both tables and views. For views, constraints and indexes
-    will typically be empty arrays.
-    
-    Note: Table and view names are case-sensitive. If the table/view name was created
-    with quoted identifiers (e.g., "atom", "Country", "Player_Attributes"), you must
-    use the exact case as defined in the schema. Use double quotes around the name
-    if it contains mixed case or special characters.
-    
-    Args:
-        schema_name: Schema name
-        table_name: Table or view name (case-sensitive, use exact case as in schema)
-        
-    Returns:
-        JSON string with table/view details containing:
-        - success: Whether the operation was successful
-        - schema_name: Schema name
-        - table_name: Table or view name
-        - columns: Array of column information (including COMMENTS for each column)
-        - constraints: Array of constraint information (empty for views)
-        - indexes: Array of index information (empty for views)
-        - error: Error message if operation failed
-    """
-    logger.info(f"Getting table info for: {schema_name}.{table_name}")
-    try:
-        connection = get_connection()
-        try:
-            columns = get_table_columns(connection, schema_name, table_name)
-            # Constraints and indexes may not exist for views, but the queries should still work
-            constraints = get_table_constraints(connection, schema_name, table_name)
-            indexes = get_table_indexes(connection, schema_name, table_name)
-            result = {
-                "success": True,
-                "schema_name": schema_name,
-                "table_name": table_name,
-                "columns": columns,
-                "constraints": constraints,
-                "indexes": indexes,
-            }
-        finally:
-            connection.close()
-    except Exception as e:
-        logger.error(f"Failed to get table info: {e}")
-        result = {
-            "success": False,
-            "error": str(e),
-            "schema_name": schema_name,
-            "table_name": table_name,
-        }
-    return json.dumps(result, ensure_ascii=False, indent=2)
+@mcp.tool(title="Describe table or view", annotations=ToolAnnotations(title="Describe table or view", **READ_ONLY))
+async def get_table_info(
+    schema_name: str = Field(description="Schema (owner) name"),
+    table_name: str = Field(description="Table or view name; an unquoted name is also tried upper-case"),
+) -> TableInfo:
+    """Describe a table or view: columns with comments, constraints (including foreign-key targets) and indexes."""
+
+    def work(conn: Any) -> TableInfo:
+        found = resolve_object(conn, schema_name, table_name)
+        if found is None:
+            raise ValueError(f"{schema_name}.{table_name} does not exist or is not visible to this account.")
+        owner, name = found["OWNER"], found["OBJECT_NAME"]
+        return TableInfo(
+            schema_name=owner,
+            table_name=name,
+            object_type=found["OBJECT_TYPE"],
+            comments=found["COMMENTS"],
+            columns=get_table_columns(conn, owner, name),
+            constraints=get_table_constraints(conn, owner, name),
+            indexes=get_table_indexes(conn, owner, name),
+        )
+
+    return await _with_connection(work)
 
 
-@mcp.tool()
-async def explain_plan(query: str) -> str:
-    """
-    Get execution plan for a SQL query without actually executing it.
-    
-    This tool analyzes the execution plan of a SQL statement (SELECT, INSERT, UPDATE, DELETE, etc.)
-    without actually executing the query. It validates whether the SQL is executable and returns
-    the execution plan in Markdown format. If the SQL is not valid, it returns an error message.
-    
-    Note: Table, view, and column names are case-sensitive. If they were created with
-    quoted identifiers (e.g., "atom", "Country", "Player_Attributes"), you must use
-    double quotes around the names in your SQL query to preserve case sensitivity.
-    Example: EXPLAIN PLAN FOR SELECT * FROM "atom" WHERE "atom_id" = '123'
-    
-    Args:
-        query: SQL query string to analyze (SELECT, INSERT, UPDATE, DELETE, etc.) (use double quotes for case-sensitive identifiers)
-        
-    Returns:
-        Markdown string with execution plan formatted as a table, including:
-        - SQL ID, execution statistics
-        - Execution plan tree with operations, costs, and cardinality
-        - Notes and additional information
-        - Error message in Markdown format if SQL is invalid or plan generation failed
-    """
-    logger.info(f"Getting execution plan for: {query[:100]}...")
-    try:
-        connection = get_connection()
-        try:
-            plan = get_execution_plan(connection, query)
-            markdown = _convert_execution_plan_to_markdown(plan)
-            return markdown
-        finally:
-            connection.close()
-    except Exception as e:
-        logger.error(f"Failed to get execution plan: {e}")
-        return f"**Error generating execution plan:**\n\n```\n{str(e)}\n```\n\n**Query:**\n```sql\n{query}\n```\n"
+def _plan_text(steps: list[PlanStep]) -> str:
+    lines = []
+    for step in steps:
+        target = ".".join(part for part in (step.object_owner, step.object_name) if part)
+        detail = f" {target}" if target else ""
+        stats = f" (cost={step.cost}, rows={step.cardinality})" if step.cost is not None else ""
+        lines.append(f"{'  ' * (step.depth or 0)}{step.id} {step.operation}{detail}{stats}")
+        for label, predicate in (("access", step.access_predicates), ("filter", step.filter_predicates)):
+            if predicate:
+                lines.append(f"{'  ' * ((step.depth or 0) + 1)}{label}: {predicate}")
+    return "\n".join(lines)
 
 
-@mcp.tool()
-async def sample_table(schema_name: str, table_name: str, limit: int = 10) -> str:
+@mcp.tool(title="Explain SQL plan", annotations=ToolAnnotations(title="Explain SQL plan", **READ_ONLY))
+async def explain_plan(
+    query: str = Field(description="SELECT or DML statement to analyze; it is not executed"),
+) -> ExplainResult:
+    """Show the optimizer's execution plan for a statement without running it.
+
+    Also a cheap way to validate SQL: invalid identifiers or syntax come back as errors.
     """
-    Sample n rows from a specific table.
-    
-    This tool retrieves a sample of rows from a table without loading all data.
-    It's useful for quickly inspecting table contents and structure.
-    
-    Note: Table names are case-sensitive. If the table name was created with quoted
-    identifiers (e.g., "atom", "Country", "Player_Attributes"), you must use the exact
-    case as defined in the schema. Use double quotes around the name if it contains
-    mixed case or special characters.
-    
-    Args:
-        schema_name: Schema name (owner) of the table
-        table_name: Name of the table to sample (case-sensitive, use exact case as in schema)
-        limit: Number of rows to sample (default: 10, maximum: 1000)
-        
-    Returns:
-        JSON string with sample result containing:
-        - success: Whether the sampling was successful
-        - schema_name: Schema name
-        - table_name: Table name
-        - rows: Array of sampled rows (each row is a dictionary with column names as keys)
-        - row_count: Number of rows returned
-        - limit: Requested limit
-        - error: Error message if sampling failed
-    """
-    logger.info(f"Sampling {limit} rows from {schema_name}.{table_name}")
-    try:
-        connection = get_connection()
-        try:
-            rows = sample_table_rows(connection, schema_name, table_name, limit)
-            result = {
-                "success": True,
-                "schema_name": schema_name,
-                "table_name": table_name,
-                "rows": rows,
-                "row_count": len(rows),
-                "limit": limit,
-                "error": None,
-            }
-        finally:
-            connection.close()
-    except Exception as e:
-        logger.error(f"Failed to sample table: {e}")
-        result = {
-            "success": False,
-            "error": str(e),
-            "schema_name": schema_name,
-            "table_name": table_name,
-        }
-        if limit != 10:  # Only include if not default value
-            result["limit"] = limit
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    logger.info(f"explain_plan: {query[:200]}")
+    rows = await _with_connection(lambda conn: get_execution_plan(conn, query))
+    steps = [PlanStep(**{key.lower(): value for key, value in row.items()}) for row in rows]
+    if not steps:
+        raise ToolError("The database produced no plan rows for this statement.")
+    return ExplainResult(steps=steps, total_cost=steps[0].cost, plan_text=_plan_text(steps))
 
 
-def get_server() -> FastMCP:
-    """
-    Get the configured FastMCP server instance.
-    
-    This function returns the Tibero MCP server instance that provides database tools
-    for query execution, schema inspection, execution plan analysis, and data sampling.
-    
-    The server includes the following tools:
-    - execute_query: Execute SELECT queries
-    - execute_dml: Execute INSERT, UPDATE, DELETE statements
-    - get_schema: Retrieve schema information
-    - get_table_info: Get detailed table/view information
-    - explain_plan: Analyze SQL execution plans
-    - sample_table: Sample rows from tables
-    
-    Returns:
-        FastMCP server instance configured for Tibero database operations
-    """
+@mcp.tool(title="Sample table rows", annotations=ToolAnnotations(title="Sample table rows", **READ_ONLY))
+async def sample_table(
+    schema_name: str = Field(description="Schema (owner) name"),
+    table_name: str = Field(description="Table or view name; an unquoted name is also tried upper-case"),
+    limit: int = Field(10, ge=1, le=1000, description="Number of rows"),
+) -> QueryResult:
+    """Return the first rows of a table or view to see real values and formats."""
+
+    def work(conn: Any) -> QueryResult:
+        found = resolve_object(conn, schema_name, table_name)
+        if found is None:
+            raise ValueError(f"{schema_name}.{table_name} does not exist or is not visible to this account.")
+        rows = sample_table_rows(conn, found["OWNER"], found["OBJECT_NAME"], limit)
+        columns = list(rows[0].keys()) if rows else [c["COLUMN_NAME"] for c in get_table_columns(conn, found["OWNER"], found["OBJECT_NAME"])]
+        return QueryResult(columns=columns, rows=rows, row_count=len(rows), truncated=False)
+
+    return await _with_connection(work)
+
+
+def get_server() -> MCPServer:
+    """Return the configured Tibero MCP server instance."""
     return mcp

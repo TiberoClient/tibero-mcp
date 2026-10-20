@@ -2,190 +2,206 @@
 
 from __future__ import annotations
 
+import base64
+import datetime as dt
+import os
+import re
+from decimal import Decimal
 from typing import Any
+
 import jaydebeapi
 from loguru import logger
+
+# Every statement gets a server-side timeout so a runaway query from a remote
+# client cannot hold a session (and a worker thread) indefinitely.
+QUERY_TIMEOUT_SECONDS = int(os.getenv("TIBERO_QUERY_TIMEOUT", "60"))
+# A single huge LOB/VARCHAR cell can blow a model's context on its own.
+MAX_CELL_CHARS = int(os.getenv("TIBERO_MAX_CELL_CHARS", "4000"))
+
+_LEADING_NOISE = re.compile(r"^(\s+|--[^\n]*\n?|/\*.*?\*/|\()+", re.DOTALL)
+_SELECT_KEYWORDS = ("SELECT", "WITH")
+_DML_KEYWORDS = ("INSERT", "UPDATE", "DELETE", "MERGE")
+
+
+class _TimedCursor(jaydebeapi.Cursor):
+    """Cursor that applies a query timeout and row cap before each execute.
+
+    JayDeBeApi prepares the statement and calls ``_set_stmt_parms`` right before
+    ``execute()``, which is the only point where the JDBC statement is reachable.
+    """
+
+    def __init__(self, connection: jaydebeapi.Connection, max_rows: int = 0):
+        super().__init__(connection, connection._converters)
+        self._max_rows = max_rows
+
+    def _set_stmt_parms(self, prep_stmt: Any, parameters: Any) -> None:
+        prep_stmt.setQueryTimeout(QUERY_TIMEOUT_SECONDS)
+        if self._max_rows:
+            prep_stmt.setMaxRows(self._max_rows)
+        super()._set_stmt_parms(prep_stmt, parameters)
+
+
+def normalize_statement(query: str) -> str:
+    """Strip whitespace and a trailing semicolon, which the JDBC driver rejects."""
+    statement = query.strip()
+    while statement.endswith(";"):
+        statement = statement[:-1].rstrip()
+    if not statement:
+        raise ValueError("SQL statement is empty.")
+    return statement
+
+
+def leading_keyword(statement: str) -> str:
+    """Return the first SQL keyword, skipping comments and opening parentheses."""
+    body = _LEADING_NOISE.sub("", statement)
+    match = re.match(r"[A-Za-z]+", body)
+    return match.group(0).upper() if match else ""
+
+
+def ensure_select(statement: str) -> None:
+    if leading_keyword(statement) not in _SELECT_KEYWORDS:
+        raise ValueError("Only SELECT (or WITH ... SELECT) statements are allowed here. Use execute_dml for INSERT/UPDATE/DELETE/MERGE.")
+
+
+def ensure_dml(statement: str) -> None:
+    if leading_keyword(statement) not in _DML_KEYWORDS:
+        raise ValueError("Only INSERT, UPDATE, DELETE or MERGE statements are allowed. DDL and other statements are rejected.")
+
+
+def quote_identifier(name: str) -> str:
+    """Quote an identifier exactly as stored in the dictionary."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def to_json_value(value: Any) -> Any:
+    """Convert a JDBC value into something JSON can carry without loss of meaning."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value() and abs(value) < 2**53:
+            return int(value)
+        return float(value) if abs(value) < 2**53 else str(value)
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        encoded = base64.b64encode(bytes(value)).decode("ascii")
+        return _truncate(f"base64:{encoded}")
+    return _truncate(str(value))
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= MAX_CELL_CHARS:
+        return text
+    return text[:MAX_CELL_CHARS] + f"...[truncated {len(text) - MAX_CELL_CHARS} chars]"
+
+
+def _fetch_dicts(cursor: jaydebeapi.Cursor, limit: int | None = None) -> tuple[list[str], list[dict[str, Any]]]:
+    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+    rows = cursor.fetchall() if limit is None else cursor.fetchmany(limit)
+    return columns, [{col: to_json_value(row[i]) for i, col in enumerate(columns)} for row in rows]
 
 
 def execute_select_query_and_fetch_results(
     connection: jaydebeapi.Connection,
     query: str,
     params: list[Any] | None = None,
-    fetch_all: bool = True,
 ) -> list[dict[str, Any]]:
-    """
-    Execute a SELECT SQL query and fetch all results as a list of dictionaries.
-
-    This function is designed specifically for SELECT queries that return result sets.
-    It executes the query, fetches all rows, and converts them to a list of dictionaries
-    where each dictionary represents a row with column names as keys.
-
-    Args:
-        connection: Database connection object
-        query: SELECT SQL query string
-        params: Optional list of parameters for parameterized queries
-        fetch_all: Whether to fetch all results (default: True)
-
-    Returns:
-        List of dictionaries representing query results, where each dictionary
-        contains column names as keys and row values as values
-
-    Raises:
-        Exception: If query execution fails
-    """
-    cursor = None
+    """Execute a dictionary/metadata SELECT and return every row as a dictionary."""
+    cursor = _TimedCursor(connection)
     try:
-        cursor = connection.cursor()
-        logger.debug(f"Executing query: {query[:100]}...")
-
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-
-        if fetch_all:
-            # Get column names
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            
-            # Fetch all rows
-            rows = cursor.fetchall()
-            
-            # Convert to list of dictionaries
-            results = []
-            for row in rows:
-                row_dict = {}
-                for i, col in enumerate(columns):
-                    row_dict[col] = row[i]
-                results.append(row_dict)
-            
-            logger.info(f"Query executed successfully. Rows returned: {len(results)}")
-            return results
-        else:
-            # Return empty list if not fetching all
-            return []
-
-    except Exception as e:
-        logger.error(f"Query execution failed: {e}")
-        raise
+        cursor.execute(query, params or None)
+        return _fetch_dicts(cursor)[1]
     finally:
-        if cursor:
-            cursor.close()
+        cursor.close()
+
+
+def run_select(
+    connection: jaydebeapi.Connection,
+    query: str,
+    max_rows: int,
+) -> dict[str, Any]:
+    """Execute a user SELECT, returning at most ``max_rows`` rows.
+
+    One extra row is requested so the caller can tell a full page from a truncated one.
+    """
+    statement = normalize_statement(query)
+    ensure_select(statement)
+    cursor = _TimedCursor(connection, max_rows=max_rows + 1)
+    try:
+        cursor.execute(statement)
+        columns, rows = _fetch_dicts(cursor, max_rows + 1)
+    finally:
+        cursor.close()
+    truncated = len(rows) > max_rows
+    rows = rows[:max_rows]
+    logger.info(f"SELECT returned {len(rows)} rows (truncated={truncated})")
+    return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": truncated}
 
 
 def execute_dml_statement_with_transaction_management(
     connection: jaydebeapi.Connection,
     query: str,
-    auto_commit: bool = True,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
+    """Execute one DML statement in its own transaction.
+
+    The statement is committed on success, or rolled back when ``dry_run`` is set
+    (useful to see how many rows would change). Any failure rolls back.
     """
-    Execute a DML statement (INSERT, UPDATE, DELETE) with transaction management.
-
-    This function executes Data Manipulation Language statements and handles
-    transaction management automatically. On success, it commits the transaction
-    (if auto_commit is enabled). On failure, it rolls back the transaction to
-    maintain data consistency.
-
-    Args:
-        connection: Database connection object
-        query: DML statement string (INSERT, UPDATE, DELETE)
-        auto_commit: Whether to automatically commit the transaction on success (default: True)
-
-    Returns:
-        Dictionary with execution result containing:
-        - success: Boolean indicating whether execution was successful
-        - rowcount: Number of rows affected by the DML statement
-
-    Raises:
-        Exception: If DML execution fails (transaction is rolled back automatically)
-    """
-    cursor = None
+    statement = normalize_statement(query)
+    ensure_dml(statement)
+    connection.jconn.setAutoCommit(False)
+    cursor = _TimedCursor(connection)
     try:
-        cursor = connection.cursor()
-        logger.debug(f"Executing DML: {query[:100]}...")
-
-        cursor.execute(query)
-
+        cursor.execute(statement)
         rowcount = cursor.rowcount
-        logger.info(f"DML executed successfully. Rows affected: {rowcount}")
-
-        # Commit transaction if auto_commit is enabled
-        if auto_commit:
+        if dry_run:
+            connection.rollback()
+        else:
             connection.commit()
-            logger.debug("Transaction committed")
-
-        return {
-            "success": True,
-            "rowcount": rowcount,
-        }
-
-    except Exception as e:
-        logger.error(f"DML execution failed: {e}")
-        # Rollback transaction on error
+        logger.info(f"DML affected {rowcount} rows (committed={not dry_run})")
+        return {"rowcount": rowcount, "committed": not dry_run}
+    except Exception:
         try:
             connection.rollback()
-            logger.debug("Transaction rolled back due to error")
         except Exception as rollback_error:
             logger.warning(f"Failed to rollback transaction: {rollback_error}")
         raise
     finally:
-        if cursor:
-            cursor.close()
+        cursor.close()
 
 
 def get_execution_plan(
     connection: jaydebeapi.Connection,
     query: str,
 ) -> list[dict[str, Any]]:
+    """Return the optimizer plan for a statement without executing it.
+
+    Tibero has no DBMS_XPLAN, so the plan is read from PLAN_TABLE. ``EXPLAIN PLAN``
+    writes rows there; preparing and reading in one uncommitted transaction and
+    rolling back keeps concurrent callers' plans apart and leaves nothing behind.
+    ``EXPLAIN PLAN`` returns no result set, so it must not be fetched.
     """
-    Get execution plan for a SQL query without actually executing it.
-
-    This function uses EXPLAIN PLAN to analyze the execution plan of a SQL statement.
-    It validates whether the SQL is executable and returns the execution plan.
-    If the SQL is not valid, it raises an exception.
-
-    Args:
-        connection: Database connection object
-        query: SQL query string (SELECT, INSERT, UPDATE, DELETE, etc.)
-
-    Returns:
-        List of dictionaries representing the execution plan rows
-
-    Raises:
-        Exception: If SQL is invalid or plan generation failed
-    """
-    cursor = None
+    statement = normalize_statement(query)
+    connection.jconn.setAutoCommit(False)
+    cursor = _TimedCursor(connection)
     try:
-        cursor = connection.cursor()
-        logger.debug(f"Getting execution plan for: {query[:100]}...")
-
-        # Create the execution plan
-        explain_query = f"EXPLAIN PLAN FOR {query}"
-        cursor.execute(explain_query)
-
-        # Get execution plan using DBMS_XPLAN.DISPLAY
-        plan_query = "SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY)"
-        cursor.execute(plan_query)
-        
-        columns = [desc[0] for desc in cursor.description] if cursor.description else []
-        rows = cursor.fetchall()
-        
-        execution_plan = []
-        for row in rows:
-            row_dict = {}
-            for i, col in enumerate(columns):
-                row_dict[col] = row[i]
-            execution_plan.append(row_dict)
-        
-        logger.info(f"Execution plan generated successfully. Plan rows: {len(execution_plan)}")
-        
-        return execution_plan
-
-    except Exception as e:
-        logger.error(f"Failed to get execution plan: {e}")
-        raise
+        cursor.execute(f"EXPLAIN PLAN FOR {statement}")
+        cursor.execute(
+            """
+            SELECT ID, PARENT_ID, DEPTH, OPERATION, OBJECT_OWNER, OBJECT_NAME,
+                   COST, CARDINALITY, ACCESS_PREDICATES, FILTER_PREDICATES
+            FROM PLAN_TABLE
+            ORDER BY ID
+            """
+        )
+        return _fetch_dicts(cursor)[1]
     finally:
-        if cursor:
-            cursor.close()
+        cursor.close()
+        try:
+            connection.rollback()
+        except Exception as rollback_error:
+            logger.warning(f"Failed to rollback explain plan: {rollback_error}")
 
 
 def sample_table_rows(
@@ -194,74 +210,12 @@ def sample_table_rows(
     table_name: str,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """
-    Sample n rows from a specific table.
-
-    This function retrieves a sample of rows from a table without loading all data.
-    It uses ROWNUM to limit the number of rows returned.
-
-    Args:
-        connection: Database connection object
-        schema_name: Schema name
-        table_name: Table name
-        limit: Number of rows to sample (default: 10, max: 1000)
-
-    Returns:
-        List of sampled rows (each row is a dictionary with column names as keys)
-
-    Raises:
-        Exception: If sampling fails
-    """
-    # Limit the maximum number of rows to prevent excessive data transfer
-    if limit > 1000:
-        limit = 1000
-        logger.warning(f"Limit exceeded maximum (1000), using 1000 instead")
-    
-    if limit < 1:
-        limit = 1
-        logger.warning(f"Limit must be at least 1, using 1 instead")
-    
-    cursor = None
+    """Return the first ``limit`` rows of a table (1..1000)."""
+    limit = max(1, min(limit, 1000))
+    query = f"SELECT * FROM {quote_identifier(schema_name)}.{quote_identifier(table_name)} WHERE ROWNUM <= {limit}"
+    cursor = _TimedCursor(connection, max_rows=limit)
     try:
-        cursor = connection.cursor()
-        logger.debug(f"Sampling {limit} rows from {schema_name}.{table_name}")
-        
-        # Build query with schema qualification
-        if schema_name:
-            qualified_table = f'"{schema_name}"."{table_name}"'
-        else:
-            qualified_table = f'"{table_name}"'
-        
-        # Use ROWNUM for Tibero/Oracle compatibility
-        query = f"""
-            SELECT * FROM {qualified_table}
-            WHERE ROWNUM <= {limit}
-        """
-        
         cursor.execute(query)
-        
-        # Get column names
-        columns = [desc[0] for desc in cursor.description] if cursor.description else []
-        
-        # Fetch all rows
-        rows = cursor.fetchall()
-        
-        # Convert to list of dictionaries
-        results = []
-        for row in rows:
-            row_dict = {}
-            for i, col in enumerate(columns):
-                row_dict[col] = row[i]
-            results.append(row_dict)
-        
-        logger.info(f"Successfully sampled {len(results)} rows from {schema_name}.{table_name}")
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Failed to sample rows from {schema_name}.{table_name}: {e}")
-        raise
+        return _fetch_dicts(cursor, limit)[1]
     finally:
-        if cursor:
-            cursor.close()
-
+        cursor.close()

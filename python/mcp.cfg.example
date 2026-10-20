@@ -5,11 +5,26 @@ TIBERO_DATABASE=tibero
 TIBERO_USER=your_username
 TIBERO_PASSWORD=your_password
 
+# Statement limits
+TIBERO_QUERY_TIMEOUT=60        # seconds per statement
+TIBERO_MAX_CELL_CHARS=4000     # longer cell values are truncated
+
 # MCP Server Configuration
-MCP_TRANSPORT=http
+MCP_TRANSPORT=http             # http (Streamable HTTP, default) or stdio
 MCP_SERVER_HOST=0.0.0.0
 MCP_SERVER_PORT=8000
+MCP_HTTP_PATH=/mcp
+
+# Authentication (required unless listening on loopback)
+# Comma-separated keys. Each is accepted as "Authorization: Bearer <key>",
+# "X-API-Key: <key>", or a path prefix: http://host:8000/<key>/mcp
+MCP_API_KEYS=
+# MCP_ALLOW_ANONYMOUS=true     # only for trusted networks
+
+# Optional DNS-rebinding protection: comma-separated Host values, e.g. mcp.example.com
+MCP_ALLOWED_HOSTS=
+# Proxies whose X-Forwarded-For is trusted for client IPs in the access log
+FORWARDED_ALLOW_IPS=127.0.0.1
 
 # Logging
 LOG_LEVEL=INFO
-

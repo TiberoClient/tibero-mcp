@@ -5,6 +5,7 @@ from .query_executor import (
     execute_select_query_and_fetch_results,
     execute_dml_statement_with_transaction_management,
     get_execution_plan,
+    run_select,
     sample_table_rows,
 )
 from .schema_viewer import (
@@ -12,6 +13,7 @@ from .schema_viewer import (
     get_table_columns,
     get_table_constraints,
     get_table_indexes,
+    resolve_object,
 )
 
 __all__ = [
@@ -20,11 +22,11 @@ __all__ = [
     "execute_select_query_and_fetch_results",
     "execute_dml_statement_with_transaction_management",
     "get_execution_plan",
+    "run_select",
     "sample_table_rows",
     "get_schema_info",
     "get_table_columns",
     "get_table_constraints",
     "get_table_indexes",
+    "resolve_object",
 ]
-
-

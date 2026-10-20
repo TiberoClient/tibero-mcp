@@ -1,4 +1,4 @@
-"""MCP server implementation using FastMCP."""
+"""MCP server implementation."""
 
 from .server import mcp, get_server
 

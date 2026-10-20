@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
+import threading
 import jaydebeapi
 from pathlib import Path
 from loguru import logger
+
+
+_CONNECT_LOCK = threading.Lock()
 
 
 class TiberoConnection:
@@ -62,17 +66,19 @@ class TiberoConnection:
         driver_class = "com.tmax.tibero.jdbc.TbDriver"
         jdbc_url = f"jdbc:tibero:thin:@{self.host}:{self.port}:{self.database}"
 
-        logger.info(f"Connecting to Tibero: {self.host}:{self.port}/{self.database}")
+        logger.debug(f"Connecting to Tibero: {self.host}:{self.port}/{self.database}")
         logger.debug(f"Using JDBC driver: {self.jdbc_jar_path}")
 
         try:
-            self.connection = jaydebeapi.connect(
-                driver_class,
-                jdbc_url,
-                [self.user, self.password],
-                self.jdbc_jar_path,
-            )
-            logger.info("Successfully connected to Tibero database")
+            # The first connect starts the JVM; two threads doing that at once fail.
+            with _CONNECT_LOCK:
+                self.connection = jaydebeapi.connect(
+                    driver_class,
+                    jdbc_url,
+                    [self.user, self.password],
+                    self.jdbc_jar_path,
+                )
+            logger.debug("Connected to Tibero database")
             return self.connection
         except Exception as e:
             logger.error(f"Failed to connect to Tibero: {e}")
@@ -83,7 +89,6 @@ class TiberoConnection:
         if self.connection:
             self.connection.close()
             self.connection = None
-            logger.info("Database connection closed")
 
     def __enter__(self) -> jaydebeapi.Connection:
         """Context manager entry."""
